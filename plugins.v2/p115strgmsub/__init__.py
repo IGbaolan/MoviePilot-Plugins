@@ -44,7 +44,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -952,7 +952,6 @@ class P115StrgmSub(_PluginBase):
 
     def api_clear_history(self, apikey: str) -> dict:
         """API: 清空历史记录"""
-        apikey = request.apikey
         if apikey != settings.API_TOKEN:
             return {"success": False, "message": "API密钥错误"}
 
