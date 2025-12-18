@@ -1,5 +1,5 @@
 """
-115网盘客户端封装
+115网盘客户端封装（优化版：singleflight + 限流 + 死锁保护）
 """
 
 from __future__ import annotations
@@ -7,7 +7,8 @@ from __future__ import annotations
 import random
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Callable, Tuple
 
@@ -23,6 +24,39 @@ except ImportError:
     logger.warning("p115client 未安装，115网盘功能不可用，请安装: pip install p115client")
 
 
+
+def _run_with_timeout(
+    api_name: str,
+    fn: Callable,
+    args: tuple,
+    kwargs: dict,
+    timeout: float,
+):
+    """
+    在独立线程里执行 fn(*args, **kwargs)，如果超时则抛 TimeoutError。
+    注意：底层线程无法被强杀，只是我们这边不再等待。
+    """
+    result_holder = {}
+    exc_holder = {}
+
+    def _target():
+        try:
+            result_holder["value"] = fn(*args, **kwargs)
+        except BaseException as e:
+            exc_holder["exc"] = e
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        # 线程还在跑，HTTP 大概率卡死了
+        raise TimeoutError(f"{api_name} call timeout after {timeout:.1f}s")
+
+    if "exc" in exc_holder:
+        raise exc_holder["exc"]
+
+    return result_holder.get("value", None)
 # ----------------------------
 # 工具：线程安全 LRU + TTL 缓存（含负缓存）
 # ----------------------------
@@ -87,7 +121,7 @@ class _RateLimiter:
 
 
 # ----------------------------
-# 工具：singleflight（同 key 并发合并）
+# 工具：singleflight（同 key 并发合并，带超时保护）
 # ----------------------------
 
 @dataclass
@@ -101,10 +135,12 @@ class _SFSlot:
 class _SingleFlight:
     """
     同 key 的并发请求只允许一个执行，其它等待结果。
+    增强点：为 follower 增加等待超时，防止 leader 线程卡死时所有请求一起卡死。
     """
-    def __init__(self):
+    def __init__(self, wait_timeout: float = 120.0):
         self._lock = threading.Lock()
         self._inflight: Dict[str, _SFSlot] = {}
+        self.wait_timeout = float(wait_timeout)
 
     def do(self, key: str, fn: Callable[[], Any]) -> Any:
         with self._lock:
@@ -117,11 +153,18 @@ class _SingleFlight:
                 leader = False
 
         if not leader:
-            slot.event.wait()
+            # follower：带超时等待，避免永久卡死
+            if not slot.event.wait(self.wait_timeout):
+                with self._lock:
+                    cur = self._inflight.get(key)
+                    if cur is slot:
+                        self._inflight.pop(key, None)
+                raise TimeoutError(f"singleflight wait timeout {self.wait_timeout}s for key={key}")
             if slot.exc:
                 raise slot.exc
             return slot.result
 
+        # leader：真正执行业务函数
         try:
             res = fn()
             slot.result = res
@@ -133,6 +176,60 @@ class _SingleFlight:
             slot.event.set()
             with self._lock:
                 self._inflight.pop(key, None)
+
+
+# ----------------------------
+# 工具：命名锁池（带超时 + 简单 GC）
+# ----------------------------
+
+class _LockPool:
+    """
+    命名锁池：
+      - 替代 defaultdict(threading.Lock)，防止 key 无上限增长；
+      - acquire 支持超时，避免因为单个线程卡死导致所有等待线程永久阻塞。
+    """
+    def __init__(self, maxsize: int = 4096, default_timeout: float = 120.0):
+        self.maxsize = maxsize
+        self.default_timeout = float(default_timeout)
+        self._locks: Dict[str, threading.Lock] = {}
+        self._order = deque()
+        self._meta_lock = threading.Lock()
+
+    def _get_lock(self, name: str) -> threading.Lock:
+        with self._meta_lock:
+            lk = self._locks.get(name)
+            if lk is None:
+                lk = threading.Lock()
+                self._locks[name] = lk
+                self._order.append(name)
+                # 简单 FIFO GC，避免锁数量无限增长
+                while len(self._order) > self.maxsize:
+                    old = self._order.popleft()
+                    if old != name:
+                        self._locks.pop(old, None)
+            return lk
+
+    def acquire(self, name: str, timeout: Optional[float] = None) -> threading.Lock:
+        lk = self._get_lock(name)
+        to = self.default_timeout if timeout is None else float(timeout)
+        ok = lk.acquire(timeout=to)
+        if not ok:
+            raise TimeoutError(f"acquire lock timeout {to}s for key={name}")
+        return lk
+
+    def release(self, name: str) -> None:
+        with self._meta_lock:
+            lk = self._locks.get(name)
+        if lk:
+            lk.release()
+
+    @contextmanager
+    def hold(self, name: str, timeout: Optional[float] = None):
+        lk = self.acquire(name, timeout=timeout)
+        try:
+            yield
+        finally:
+            lk.release()
 
 
 # ----------------------------
@@ -176,7 +273,7 @@ def _is_risk_control_error(resp_or_exc: Any) -> bool:
 # ----------------------------
 
 class P115ClientManager:
-    """115网盘客户端管理器（singleflight + 统计 + 风控友好）"""
+    """115网盘客户端管理器（singleflight + 统计 + 风控友好 + 死锁保护）"""
 
     _DEFAULT_LIMITS = {
         "dir_getid": (2.0, 0.25),
@@ -201,21 +298,21 @@ class P115ClientManager:
 
         self._files_cache = _LRUTTLCache(maxsize=2000, ttl_sec=15.0)
 
-        # 同路径/同转存 串行化 lock
-        self._locks = defaultdict(threading.Lock)
+        # 命名锁池（替代 defaultdict(threading.Lock)）
+        self._locks = _LockPool(maxsize=4096, default_timeout=120.0)
 
         # limiter
         self._limiters: Dict[str, _RateLimiter] = {}
         for name, (rps, jitter) in self._DEFAULT_LIMITS.items():
             self._limiters[name] = _RateLimiter(rps=rps, jitter_sec=jitter)
 
-        # singleflight：用于 fs_dir_getid(path)
-        self._sf_dir_getid = _SingleFlight()
+        # singleflight：用于 fs_dir_getid(path)，带等待超时
+        self._sf_dir_getid = _SingleFlight(wait_timeout=120.0)
 
         # 请求计数
         self._req_count = defaultdict(int)
         self._req_count_lock = threading.Lock()
-        self._log_req_every = 5  # 每累计 N 次请求自动打印一次统计
+        self._log_req_every = 20  # 打印频率稍微放大一点
         self._req_total = 0
 
         if P115_AVAILABLE and cookies:
@@ -238,8 +335,12 @@ class P115ClientManager:
     def log_request_stats(self, level: str = "info") -> None:
         """打印当前请求次数统计"""
         stats = self.get_request_stats()
-        items = sorted(((k, v) for k, v in stats.items() if k != "total"), key=lambda x: -x[1])
-        msg = "115 API 请求统计：total={total} | ".format(total=stats.get("total", 0)) + ", ".join([f"{k}={v}" for k, v in items[:12]])
+        items = sorted(
+            ((k, v) for k, v in stats.items() if k != "total"),
+            key=lambda x: -x[1],
+        )
+        msg = "115 API 请求统计：total={total} | ".format(total=stats.get("total", 0)) + \
+              ", ".join([f"{k}={v}" for k, v in items[:12]])
         getattr(logger, level, logger.info)(msg)
 
     def _inc_req(self, api_name: str) -> None:
@@ -262,10 +363,18 @@ class P115ClientManager:
         max_retry: int = 5,
         base_delay: float = 0.8,
         must_check_state: bool = False,
+        call_timeout: float = 10.0,
         **kwargs
     ):
+        """
+        统一接口调用入口：
+          - 限流
+          - 统计
+          - 每次调用加硬超时（call_timeout）
+          - 风控识别 + 指数退避重试
+        """
         limiter = self._limiters.get(api_name)
-        last_exc = None
+        last_exc: Optional[BaseException] = None
 
         for i in range(max_retry + 1):
             try:
@@ -274,7 +383,15 @@ class P115ClientManager:
 
                 # 计数：只统计“实际发出”的调用次数
                 self._inc_req(api_name)
-                resp = fn(*args, **kwargs)
+
+                # 关键：在独立线程中执行 fn，带硬超时
+                resp = _run_with_timeout(
+                    api_name=api_name,
+                    fn=fn,
+                    args=args,
+                    kwargs=kwargs,
+                    timeout=call_timeout,
+                )
 
                 if must_check_state and isinstance(resp, dict):
                     if not resp.get("state", False) and _is_risk_control_error(resp):
@@ -283,18 +400,26 @@ class P115ClientManager:
 
             except Exception as e:
                 last_exc = e
+
+                # 超时 / 连接错误 / 解析错误 等，都走这里
+                # 只有“风控/限频类”错误才会重试，其它直接抛出
+                if not _is_risk_control_error(e):
+                    # 打个日志方便你判断是不是超时
+                    logger.error(f"{api_name} 调用异常（不重试）: {_stringify_exc(e)}")
+                    raise
+
                 if i >= max_retry:
                     raise
 
-                if not _is_risk_control_error(e):
-                    raise
-
                 delay = base_delay * (2 ** i) + random.uniform(0.0, 0.65)
-                logger.warning(f"{api_name} 疑似风控/限频，退避 {delay:.2f}s 重试({i+1}/{max_retry})：{_stringify_exc(e)}")
+                logger.warning(
+                    f"{api_name} 疑似风控/限频，退避 {delay:.2f}s 重试({i+1}/{max_retry})：{_stringify_exc(e)}"
+                )
                 time.sleep(delay)
 
         if last_exc:
             raise last_exc
+
 
     # ----------------------------
     # 对外方法（签名/返回兼容）
@@ -304,7 +429,13 @@ class P115ClientManager:
         if not self.client:
             return False
         try:
-            user_info = self._call("user_my_info", self.client.user_my_info, max_retry=3, base_delay=0.8)
+            user_info = self._call(
+                "user_my_info",
+                self.client.user_my_info,
+                max_retry=3,
+                base_delay=0.8,
+                must_check_state=True,
+            )
             if isinstance(user_info, dict) and user_info.get("state"):
                 uname = user_info.get("data", {}).get("uname", "未知")
                 logger.info(f"115 登录成功: {uname}")
@@ -316,12 +447,20 @@ class P115ClientManager:
 
     def _dir_getid_singleflight(self, path: str) -> Dict[str, Any]:
         """
-        对 fs_dir_getid(path) 做 singleflight 合并。
+        对 fs_dir_getid(path) 做 singleflight 合并，带等待超时。
         """
+        if not self.client:
+            return {}
         key = f"dir_getid:{path}"
         return self._sf_dir_getid.do(
             key,
-            lambda: self._call("dir_getid", self.client.fs_dir_getid, path, max_retry=4, base_delay=0.9)
+            lambda: self._call(
+                "dir_getid",
+                self.client.fs_dir_getid,
+                path,
+                max_retry=4,
+                base_delay=0.9,
+            ),
         )
 
     def get_pid_by_path(self, path: str, mkdir: bool = True) -> int:
@@ -347,9 +486,10 @@ class P115ClientManager:
             if not mkdir and cached == -1:
                 return -1
 
-        # 同一路径串行化（创建目录时尤其重要）
-        lock = self._locks[f"pid:{path}"]
-        with lock:
+        # 同一路径串行化（创建目录时尤其重要），带锁超时保护
+        lock_name = f"pid:{path}"
+        with self._locks.hold(lock_name):
+            # double-check
             if path in self.path_cache:
                 return self.path_cache[path]
 
@@ -369,14 +509,17 @@ class P115ClientManager:
                     self.path_cache[path] = cid
                     self._pid_cache.set(path, cid, ttl_sec=2 * 3600)
                     return cid
+            except TimeoutError as e:
+                logger.error(f"fs_dir_getid singleflight 超时: {e}")
             except Exception:
+                # 这里不直接失败，后面继续尝试逐级创建
                 pass
 
             if not mkdir:
                 self._pid_cache.set(path, -1, ttl_sec=120.0)
                 return -1
 
-            # 2) 逐级创建/查找（每级也用 singleflight）
+            # 2) 逐级创建/查找（每级也用 singleflight），锁范围仅限当前 path 的整体过程
             parent_id = 0
             current_path = ""
             parts = [p for p in path.split("/") if p]
@@ -403,6 +546,9 @@ class P115ClientManager:
                         self._pid_cache.set(current_path, cid, ttl_sec=2 * 3600)
                         parent_id = cid
                         got = True
+                except TimeoutError as e:
+                    logger.error(f"fs_dir_getid singleflight 超时: {current_path} -> {e}")
+                    got = False
                 except Exception:
                     got = False
 
@@ -440,6 +586,8 @@ class P115ClientManager:
             self._pid_cache.set(path, parent_id, ttl_sec=2 * 3600)
             return parent_id
 
+    # ---- 分享相关 ----
+
     def extract_share_info(self, url: str) -> Dict[str, str]:
         if not P115_AVAILABLE:
             return {}
@@ -464,9 +612,22 @@ class P115ClientManager:
             logger.error("无效的分享链接或解析失败")
             return []
 
-        return self._list_share_files_recursive(share_code, receive_code, cid=cid, depth=1, max_depth=max_depth)
+        return self._list_share_files_recursive(
+            share_code,
+            receive_code,
+            cid=cid,
+            depth=1,
+            max_depth=max_depth,
+        )
 
-    def _list_share_files_recursive(self, share_code: str, receive_code: str, cid: int = 0, depth: int = 1, max_depth: int = 3) -> List[dict]:
+    def _list_share_files_recursive(
+        self,
+        share_code: str,
+        receive_code: str,
+        cid: int = 0,
+        depth: int = 1,
+        max_depth: int = 3,
+    ) -> List[dict]:
         if depth > max_depth:
             return []
 
@@ -496,7 +657,11 @@ class P115ClientManager:
                 if file_info["is_dir"] and depth < max_depth:
                     sub_cid = int(item.get("id", 0))
                     file_info["children"] = self._list_share_files_recursive(
-                        share_code, receive_code, cid=sub_cid, depth=depth + 1, max_depth=max_depth
+                        share_code,
+                        receive_code,
+                        cid=sub_cid,
+                        depth=depth + 1,
+                        max_depth=max_depth,
                     )
 
                 files.append(file_info)
@@ -504,7 +669,9 @@ class P115ClientManager:
         except Exception as e:
             if _is_risk_control_error(e):
                 delay = 1.5 + random.uniform(0.0, 1.0)
-                logger.warning(f"列出分享文件疑似风控，延迟 {delay:.2f}s 后放弃本层：{_stringify_exc(e)}")
+                logger.warning(
+                    f"列出分享文件疑似风控，延迟 {delay:.2f}s 后放弃本层：{_stringify_exc(e)}"
+                )
                 time.sleep(delay)
             else:
                 logger.error(f"列出分享文件失败: {e}")
@@ -537,8 +704,8 @@ class P115ClientManager:
             "is_check": 0,
         }
 
-        lock = self._locks[f"receive_all:{share_code}:{parent_id}"]
-        with lock:
+        lock_name = f"receive_all:{share_code}:{parent_id}"
+        with self._locks.hold(lock_name):
             try:
                 resp = self._call(
                     "share_receive",
@@ -585,8 +752,8 @@ class P115ClientManager:
             "is_check": 0,
         }
 
-        lock = self._locks[f"receive_one:{share_code}:{file_id}:{parent_id}"]
-        with lock:
+        lock_name = f"receive_one:{share_code}:{file_id}:{parent_id}"
+        with self._locks.hold(lock_name):
             try:
                 resp = self._call(
                     "share_receive",
@@ -611,6 +778,8 @@ class P115ClientManager:
                 logger.error(f"文件转存过程中发生异常: {e}")
                 return False
 
+    # ---- 列表相关 ----
+
     def list_files(self, path: str) -> List[dict]:
         if not self.client:
             return []
@@ -632,7 +801,14 @@ class P115ClientManager:
 
             for _ in range(max_pages):
                 params = {"cid": cid, "limit": limit, "offset": offset}
-                resp = self._call("fs_files", self.client.fs_files, params, max_retry=4, base_delay=1.0, must_check_state=True)
+                resp = self._call(
+                    "fs_files",
+                    self.client.fs_files,
+                    params,
+                    max_retry=4,
+                    base_delay=1.0,
+                    must_check_state=True,
+                )
                 if not (isinstance(resp, dict) and resp.get("state")):
                     break
                 data = resp.get("data", []) or []
@@ -644,7 +820,14 @@ class P115ClientManager:
                 offset += limit
 
             if not all_data:
-                resp = self._call("fs_files", self.client.fs_files, {"cid": cid, "limit": 1000}, max_retry=4, base_delay=1.0, must_check_state=True)
+                resp = self._call(
+                    "fs_files",
+                    self.client.fs_files,
+                    {"cid": cid, "limit": 1000},
+                    max_retry=4,
+                    base_delay=1.0,
+                    must_check_state=True,
+                )
                 if isinstance(resp, dict) and resp.get("state"):
                     all_data = resp.get("data", []) or []
 

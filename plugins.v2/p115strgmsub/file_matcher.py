@@ -4,7 +4,7 @@
 """
 import re
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 from app.core.metainfo import MetaInfo
 from app.schemas import MediaInfo
 from app.log import logger
@@ -78,6 +78,20 @@ class FileMatcher:
         return False
 
     @staticmethod
+    def _extract_episode_from_sxex(file_name: str) -> Optional[Tuple[int, int]]:
+        """
+        从文件名中提取 SxxExx 格式的季号和集号
+
+        :param file_name: 文件名
+        :return: (季号, 集号) 或 None
+        """
+        # 匹配 S01E01、S1E1 等格式
+        match = re.search(r'[Ss](\d{1,2})[Ee](\d{1,2})', file_name)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return None
+
+    @staticmethod
     def match_episode_file(
         files: List[dict],
         title: str,
@@ -93,12 +107,6 @@ class FileMatcher:
         :param episode: 集号
         :return: 匹配的文件信息
         """
-        # 严格模式：必须包含季号的匹配模式
-        strict_patterns = [
-            # S01E01 格式 (最常见且准确)
-            rf'[Ss]0?{season}[Ee]0?{episode}(?!\d)',
-        ]
-
         # 宽松模式：不包含季号的匹配模式（需要额外验证）
         loose_patterns = [
             # 第1集 格式
@@ -110,7 +118,7 @@ class FileMatcher:
         ]
 
         # 最宽松模式：纯数字匹配（风险较高，仅作为最后手段）
-        # 仅当文件名明确匹配目标季或无季号标识时使用
+        # 仅当文件名没有 SxxExx 格式且明确匹配目标季或无季号标识时使用
         loosest_patterns = [
             # .01. 格式
             rf'[\.\s\-_]0?{episode}[\.\s\-_]',
@@ -143,29 +151,33 @@ class FileMatcher:
             if FileMatcher._contains_other_season(file_name, season):
                 continue
 
-            # 严格模式匹配
-            for pattern in strict_patterns:
-                if re.search(pattern, file_name, re.IGNORECASE):
+            # 优先检查 SxxExx 格式（最准确）
+            sxex_info = FileMatcher._extract_episode_from_sxex(file_name)
+            if sxex_info:
+                found_season, found_episode = sxex_info
+                # 如果有明确的 SxxExx 格式，必须精确匹配，不再使用其他模式
+                if found_season == season and found_episode == episode:
                     strict_matches.append(file)
+                # 不匹配则跳过这个文件，不再尝试其他模式
+                continue
+
+            # 没有 SxxExx 格式时，使用宽松模式匹配
+            for pattern in loose_patterns:
+                if re.search(pattern, file_name, re.IGNORECASE):
+                    # 额外检查：如果是第一季，或者文件名明确匹配目标季
+                    if season == 1 or FileMatcher._matches_target_season(file_name, season):
+                        loose_matches.append(file)
+                    # 如果文件名没有任何季号标识，也接受（可能是单季剧）
+                    elif not re.search(r'[Ss]\d+[Ee]|第\s*\d+\s*季|[Ss]eason\s*\d+', file_name, re.IGNORECASE):
+                        loose_matches.append(file)
                     break
             else:
-                # 宽松模式匹配：需要确保没有其他季标识
-                for pattern in loose_patterns:
-                    if re.search(pattern, file_name, re.IGNORECASE):
-                        # 额外检查：如果是第一季，或者文件名明确匹配目标季
-                        if season == 1 or FileMatcher._matches_target_season(file_name, season):
-                            loose_matches.append(file)
-                        # 如果文件名没有任何季号标识，也接受（可能是单季剧）
-                        elif not re.search(r'[Ss]\d+[Ee]|第\s*\d+\s*季|[Ss]eason\s*\d+', file_name, re.IGNORECASE):
-                            loose_matches.append(file)
-                        break
-                else:
-                    # 最宽松模式：仅当文件名明确匹配目标季时使用
-                    if FileMatcher._matches_target_season(file_name, season):
-                        for pattern in loosest_patterns:
-                            if re.search(pattern, file_name, re.IGNORECASE):
-                                loosest_matches.append(file)
-                                break
+                # 最宽松模式：仅当文件名明确匹配目标季时使用
+                if FileMatcher._matches_target_season(file_name, season):
+                    for pattern in loosest_patterns:
+                        if re.search(pattern, file_name, re.IGNORECASE):
+                            loosest_matches.append(file)
+                            break
 
         # 按优先级返回匹配结果
         if strict_matches:

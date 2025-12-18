@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
 from app.log import logger
-
+from app.db import SessionFactory
 
 class UIConfig:
     """UI配置管理类"""
@@ -19,7 +19,8 @@ class UIConfig:
         :return: 订阅选项列表 [{"title": "显示名", "value": id}, ...]
         """
         try:
-            subscribes = SubscribeOper().list('R')
+            with SessionFactory() as db:
+                subscribes = SubscribeOper(db=db).list("N,R")
             if not subscribes:
                 return []
 

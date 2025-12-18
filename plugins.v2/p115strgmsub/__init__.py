@@ -17,6 +17,8 @@ from app.core.config import settings, global_vars
 from app.core.event import Event, eventmanager
 from app.core.metainfo import MetaInfo
 from app.chain.download import DownloadChain
+from app.chain.subscribe import SubscribeChain
+from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -170,7 +172,7 @@ class P115StrgmSub(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         """获取插件API"""
-        return []
+        # return []
         return [
             {
                 "path": "/search",
@@ -273,6 +275,142 @@ class P115StrgmSub(_PluginBase):
             })
         return converted
 
+    def _check_and_finish_subscribe(self, subscribe, mediainfo, success_episodes):
+        """
+        检查订阅是否完成，如果完成则调用官方接口
+        
+        :param subscribe: 订阅对象
+        :param mediainfo: 媒体信息
+        :param success_episodes: 本次成功转存的集数列表（电影为[1]）
+        """
+        try:
+            # 更新缺失集数
+            current_lack = subscribe.lack_episode
+            new_lack = max(0, current_lack - len(success_episodes))
+            
+            if new_lack != current_lack:
+                SubscribeOper().update(subscribe.id, {
+                    "lack_episode": new_lack
+                })
+                logger.info(f"更新订阅 {subscribe.name} 缺失集数：{current_lack} -> {new_lack}")
+            
+            # 检查是否完成
+            if new_lack == 0:
+                logger.info(f"订阅 {subscribe.name} 所有内容已转存完成，准备完成订阅")
+                
+                # 生成元数据
+                meta = MetaInfo(subscribe.name)
+                meta.year = subscribe.year
+                meta.begin_season = subscribe.season or None
+                try:
+                    meta.type = MediaType(subscribe.type)
+                except ValueError:
+                    logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
+                    return
+                
+                # 调用官方完成订阅接口
+                try:
+                    SubscribeChain().finish_subscribe_or_not(
+                        subscribe=subscribe,
+                        meta=meta,
+                        mediainfo=mediainfo,
+                        downloads=None,  # 我们已经更新了 lack_episode
+                        lefts={},        # 没有剩余集数
+                        force=True       # 强制完成
+                    )
+                    logger.info(f"✅ 订阅 {subscribe.name} 已完成并移至历史记录")
+                except Exception as e:
+                    logger.error(f"完成订阅时出错：{e}", exc_info=True)
+        
+        except Exception as e:
+            logger.error(f"检查订阅完成状态时出错：{e}", exc_info=True)
+
+    def _pansou_search(self, keyword: str) -> List[Dict]:
+        """
+        PanSou 搜索的通用逻辑
+        
+        :param keyword: 搜索关键词
+        :return: 115网盘资源列表
+        """
+        cloud_types = ["115"] if self._only_115 else None
+        
+        channels = None
+        if self._pansou_channels and self._pansou_channels.strip():
+            channels = [ch.strip() for ch in self._pansou_channels.split(',') if ch.strip()]
+        
+        search_results = self._pansou_client.search(
+            keyword=keyword,
+            cloud_types=cloud_types,
+            channels=channels,
+            limit=20
+        )
+        
+        results = search_results.get("results", {}) if search_results and not search_results.get("error") else {}
+        return results.get("115网盘", [])
+
+    def _search_resources(
+        self,
+        mediainfo: MediaInfo,
+        media_type: MediaType,
+        season: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        统一的资源搜索方法，支持电影和电视剧
+        
+        :param mediainfo: 媒体信息
+        :param media_type: 媒体类型（MOVIE 或 TV）
+        :param season: 季号（电视剧必需）
+        :return: 115网盘资源列表
+        """
+        p115_results = []
+        
+        # 1. 优先使用 NullBR
+        if self._nullbr_priority and self._nullbr_enabled and self._nullbr_client and mediainfo.tmdb_id:
+            if media_type == MediaType.MOVIE:
+                logger.info(f"使用 Nullbr 查询电影资源: {mediainfo.title} (TMDB ID: {mediainfo.tmdb_id})")
+                nullbr_resources = self._nullbr_client.get_movie_resources(mediainfo.tmdb_id)
+            else:  # MediaType.TV
+                logger.info(f"使用 Nullbr 查询电视剧资源: {mediainfo.title} S{season} (TMDB ID: {mediainfo.tmdb_id})")
+                nullbr_resources = self._nullbr_client.get_tv_resources(mediainfo.tmdb_id, season)
+            
+            if nullbr_resources:
+                p115_results = self._convert_nullbr_to_pansou_format(nullbr_resources)
+                logger.info(f"Nullbr 找到 {len(p115_results)} 个资源")
+        
+        # 2. 如果 NullBR 未找到，使用 PanSou
+        if not p115_results and self._pansou_enabled and self._pansou_client:
+            # 构建搜索关键词
+            if media_type == MediaType.MOVIE:
+                logger.info(f"使用 PanSou 搜索电影资源: {mediainfo.title}")
+                search_keyword = f"{mediainfo.title} {mediainfo.year}" if mediainfo.year else mediainfo.title
+                # 执行搜索
+                p115_results = self._pansou_search(search_keyword)
+            else:  # MediaType.TV
+                # 电视剧使用降级搜索策略
+                # 搜索关键词列表，按优先级排序
+                search_keywords = [
+                    f"{mediainfo.title} 第{season}季",  # 中文季号格式
+                    f"{mediainfo.title} S{season:02d}",  # 英文季号格式 S01
+                    f"{mediainfo.title} S{season}",      # 英文季号格式 S1
+                ]
+                # 第一季额外添加只搜剧名的降级选项（第一季资源通常不标注季号）
+                if season == 1:
+                    search_keywords.append(mediainfo.title)
+                else:
+                    # 非第一季：最后降级为只搜剧名（但匹配时会验证季号）
+                    search_keywords.append(mediainfo.title)
+
+                for keyword in search_keywords:
+                    logger.info(f"使用 PanSou 搜索电视剧资源: {mediainfo.title} S{season}，关键词: '{keyword}'")
+                    p115_results = self._pansou_search(keyword)
+                    if p115_results:
+                        logger.info(f"关键词 '{keyword}' 搜索到 {len(p115_results)} 个结果")
+                        break
+                    else:
+                        logger.info(f"关键词 '{keyword}' 无结果，尝试下一个降级关键词")
+        
+        return p115_results
+
     def stop_service(self):
         """退出插件"""
         try:
@@ -313,7 +451,10 @@ class P115StrgmSub(_PluginBase):
         logger.info("开始执行 115 网盘订阅追更...")
 
         # 获取所有订阅，状态为 R (订阅中) 的
-        subscribes = SubscribeOper().list("R")
+        # 使用新会话避免 ScopedSession 缓存问题，确保获取最新数据
+        with SessionFactory() as db:
+            subscribes = SubscribeOper(db=db).list("N,R")
+        
         if not subscribes:
             logger.info("没有订阅中的数据")
             return
@@ -377,36 +518,11 @@ class P115StrgmSub(_PluginBase):
                     logger.warn(f"无法识别媒体信息：{subscribe.name}")
                     continue
 
-                # 搜索网盘资源 - 根据优先级选择 Nullbr 或 PanSou
-                p115_results = []
-                
-                # 优先使用 Nullbr（如果启用且有 TMDB ID）
-                if self._nullbr_priority and self._nullbr_enabled and self._nullbr_client and mediainfo.tmdb_id:
-                    logger.info(f"使用 Nullbr 查询电影资源: {mediainfo.title} (TMDB ID: {mediainfo.tmdb_id})")
-                    nullbr_resources = self._nullbr_client.get_movie_resources(mediainfo.tmdb_id)
-                    if nullbr_resources:
-                        p115_results = self._convert_nullbr_to_pansou_format(nullbr_resources)
-                        logger.info(f"Nullbr 找到 {len(p115_results)} 个资源")
-                
-                # 如果 Nullbr 未找到或未启用，使用 PanSou 搜索
-                if not p115_results and self._pansou_enabled and self._pansou_client:
-                    logger.info(f"使用 PanSou 搜索电影资源: {mediainfo.title}")
-                    search_keyword = f"{mediainfo.title} {mediainfo.year}" if mediainfo.year else mediainfo.title
-                    cloud_types = ["115"] if self._only_115 else None
-
-                    channels = None
-                    if self._pansou_channels and self._pansou_channels.strip():
-                        channels = [ch.strip() for ch in self._pansou_channels.split(',') if ch.strip()]
-
-                    search_results = self._pansou_client.search(
-                        keyword=search_keyword,
-                        cloud_types=cloud_types,
-                        channels=channels,
-                        limit=20
-                    )
-
-                    results = search_results.get("results", {}) if search_results and not search_results.get("error") else {}
-                    p115_results = results.get("115网盘", [])
+                # 搜索网盘资源
+                p115_results = self._search_resources(
+                    mediainfo=mediainfo,
+                    media_type=MediaType.MOVIE
+                )
 
                 if not p115_results:
                     logger.info(f"未找到电影 {mediainfo.title} 的 115 网盘资源")
@@ -467,6 +583,13 @@ class P115StrgmSub(_PluginBase):
                                 transferred_count += 1
                                 movie_transferred = True
                                 logger.info(f"成功转存电影：{mediainfo.title}")
+                                
+                                # 电影转存成功后完成订阅
+                                self._check_and_finish_subscribe(
+                                    subscribe=subscribe,
+                                    mediainfo=mediainfo,
+                                    success_episodes=[1]  # 电影用 [1] 表示
+                                )
                             else:
                                 logger.error(f"转存失败：{mediainfo.title}")
 
@@ -599,55 +722,12 @@ class P115StrgmSub(_PluginBase):
 
                 logger.info(f"{mediainfo.title_year} S{season} 待转存剧集：{missing_episodes}")
 
-                # 搜索网盘资源 - 根据优先级选择 Nullbr 或 PanSou
-                p115_results = []
-                
-                # 优先使用 Nullbr（如果启用且有 TMDB ID）
-                if self._nullbr_priority and self._nullbr_enabled and self._nullbr_client and mediainfo.tmdb_id:
-                    logger.info(f"使用 Nullbr 查询电视剧资源: {mediainfo.title} S{season} (TMDB ID: {mediainfo.tmdb_id})")
-                    nullbr_resources = self._nullbr_client.get_tv_resources(mediainfo.tmdb_id, season)
-                    if nullbr_resources:
-                        p115_results = self._convert_nullbr_to_pansou_format(nullbr_resources)
-                        logger.info(f"Nullbr 找到 {len(p115_results)} 个资源")
-                
-                # 如果 Nullbr 未找到或未启用，使用 PanSou 搜索
-                if not p115_results and self._pansou_enabled and self._pansou_client:
-                    logger.info(f"使用 PanSou 搜索电视剧资源: {mediainfo.title} S{season}")
-                    # 优化搜索关键字：根据季号构建不同的搜索策略
-                    # 第一    季：优先搜索 "剧名 第1季"，如果无结果再搜索纯剧名
-                    # 其他季：搜索 "剧名 第X季"
-                    search_keyword = f"{mediainfo.title} 第{season}季"
-                    
-                    cloud_types = ["115"] if self._only_115 else None
-                    
-                    # 解析TG频道列表
-                    channels = None
-                    if self._pansou_channels and self._pansou_channels.strip():
-                        channels = [ch.strip() for ch in self._pansou_channels.split(',') if ch.strip()]
-
-                    search_results = self._pansou_client.search(
-                        keyword=search_keyword,
-                        cloud_types=cloud_types,
-                        channels=channels,
-                        limit=20
-                    )
-
-                    results = search_results.get("results", {}) if search_results and not search_results.get("error") else {}
-                    p115_results = results.get("115网盘", [])
-
-                    # 如果是第一季且搜索无结果，尝试用纯剧名再搜索
-                    if not p115_results and season == 1:
-                        fallback_keyword = mediainfo.title
-                        logger.info(f"第一季搜索 '{search_keyword}' 无结果，尝试搜索 '{fallback_keyword}'")
-                        fallback_results = self._pansou_client.search(
-                            keyword=fallback_keyword,
-                            cloud_types=cloud_types,
-                            channels=channels,
-                            limit=20
-                        )
-                        if fallback_results and not fallback_results.get("error"):
-                            results = fallback_results.get("results", {})
-                            p115_results = results.get("115网盘", [])
+                # 搜索网盘资源
+                p115_results = self._search_resources(
+                    mediainfo=mediainfo,
+                    media_type=MediaType.TV,
+                    season=season
+                )
 
                 if not p115_results:
                     logger.info(f"未找到 {mediainfo.title} S{season} 的 115 网盘资源")
@@ -732,21 +812,13 @@ class P115StrgmSub(_PluginBase):
                         logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
                         continue
 
-                # 更新订阅的缺失集数
-                # 只有当确实转存成功了一些集数，才更新
+                # 更新订阅的缺失集数并检查是否完成
                 if success_episodes:
-                    # 重新计算剩余缺失数
-                    # 这里有点复杂，因为 no_exists 是基于媒体库的。
-                    # 我们转存到网盘后，媒体库并不会立即有（除非开了挂载和自动扫描）。
-                    # 但为了 UI 上能看到进度，或者为了逻辑正确，可以减少 lack_episode。
-                    current_lack = subscribe.lack_episode
-                    new_lack = max(0, current_lack - len(success_episodes))
-                    
-                    if new_lack != current_lack:
-                        SubscribeOper().update(subscribe.id, {
-                            "lack_episode": new_lack
-                        })
-                        logger.info(f"更新订阅 {subscribe.name} 缺失集数：{current_lack} -> {new_lack}")
+                    self._check_and_finish_subscribe(
+                        subscribe=subscribe,
+                        mediainfo=mediainfo,
+                        success_episodes=success_episodes
+                    )
 
             except Exception as e:
                 logger.error(f"处理订阅 {subscribe.name} 出错：{str(e)}")
