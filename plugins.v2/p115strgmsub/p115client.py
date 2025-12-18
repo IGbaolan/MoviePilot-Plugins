@@ -1,19 +1,13 @@
 """
-115网盘客户端封装（优化版：singleflight + 限流 + 死锁保护）
+115网盘客户端封装
 """
-
-from __future__ import annotations
-
-import random
-import threading
 import time
-from collections import OrderedDict, defaultdict, deque
-from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Callable, Tuple
+import threading
+from pathlib import Path
+from functools import wraps
+from typing import Optional, List, Dict, Any, Tuple, Callable
 
 from app.log import logger
-
 try:
     from p115client import P115Client, check_response
     from p115client.util import share_extract_payload
@@ -24,296 +18,171 @@ except ImportError:
     logger.warning("p115client 未安装，115网盘功能不可用，请安装: pip install p115client")
 
 
-
-def _run_with_timeout(
-    api_name: str,
-    fn: Callable,
-    args: tuple,
-    kwargs: dict,
-    timeout: float,
-):
+class RateLimiter:
     """
-    在独立线程里执行 fn(*args, **kwargs)，如果超时则抛 TimeoutError。
-    注意：底层线程无法被强杀，只是我们这边不再等待。
+    API 请求速率限制器
+    确保请求之间有最小间隔，并添加随机抖动避免触发风控
     """
-    result_holder = {}
-    exc_holder = {}
 
-    def _target():
-        try:
-            result_holder["value"] = fn(*args, **kwargs)
-        except BaseException as e:
-            exc_holder["exc"] = e
-
-    t = threading.Thread(target=_target, daemon=True)
-    t.start()
-    t.join(timeout)
-
-    if t.is_alive():
-        # 线程还在跑，HTTP 大概率卡死了
-        raise TimeoutError(f"{api_name} call timeout after {timeout:.1f}s")
-
-    if "exc" in exc_holder:
-        raise exc_holder["exc"]
-
-    return result_holder.get("value", None)
-# ----------------------------
-# 工具：线程安全 LRU + TTL 缓存（含负缓存）
-# ----------------------------
-
-@dataclass
-class _CacheItem:
-    value: Any
-    expire_at: float
-
-
-class _LRUTTLCache:
-    def __init__(self, maxsize: int = 5000, ttl_sec: float = 1800.0):
-        self.maxsize = maxsize
-        self.ttl_sec = ttl_sec
-        self._data: OrderedDict[str, _CacheItem] = OrderedDict()
-        self._lock = threading.RLock()
-
-    def get(self, key: str) -> Tuple[bool, Any]:
-        now = time.time()
-        with self._lock:
-            item = self._data.get(key)
-            if not item:
-                return False, None
-            if item.expire_at < now:
-                self._data.pop(key, None)
-                return False, None
-            self._data.move_to_end(key)
-            return True, item.value
-
-    def set(self, key: str, value: Any, ttl_sec: Optional[float] = None) -> None:
-        now = time.time()
-        exp = now + (self.ttl_sec if ttl_sec is None else ttl_sec)
-        with self._lock:
-            self._data[key] = _CacheItem(value=value, expire_at=exp)
-            self._data.move_to_end(key)
-            while len(self._data) > self.maxsize:
-                self._data.popitem(last=False)
-
-    def delete(self, key: str) -> None:
-        with self._lock:
-            self._data.pop(key, None)
-
-
-# ----------------------------
-# 工具：请求节流 + 抖动
-# ----------------------------
-
-class _RateLimiter:
-    def __init__(self, rps: float, jitter_sec: float = 0.25):
-        self.rps = max(0.0001, float(rps))
-        self.min_interval = 1.0 / self.rps
-        self.jitter_sec = max(0.0, float(jitter_sec))
+    def __init__(self, min_interval: float = 1.5, jitter_ratio: float = 0.3):
+        """
+        :param min_interval: 基础请求间隔（秒），实际间隔会在此基础上随机浮动
+        :param jitter_ratio: 抖动比例，如 0.3 表示 ±30% 的随机浮动
+        """
+        self.min_interval = min_interval
+        self.jitter_ratio = jitter_ratio
+        self.last_request_time = 0.0
         self._lock = threading.Lock()
-        self._next_ts = 0.0
 
-    def wait(self) -> None:
+    def _get_jittered_interval(self) -> float:
+        """获取带随机抖动的间隔时间"""
+        import random
+        jitter = self.min_interval * self.jitter_ratio
+        return self.min_interval + random.uniform(-jitter, jitter)
+
+    def wait(self):
+        """等待直到可以发起下一次请求（带随机抖动）"""
         with self._lock:
             now = time.time()
-            if now < self._next_ts:
-                time.sleep(self._next_ts - now)
-            self._next_ts = time.time() + self.min_interval + random.uniform(0.0, self.jitter_sec)
+            elapsed = now - self.last_request_time
+            target_interval = self._get_jittered_interval()
+            if elapsed < target_interval:
+                sleep_time = target_interval - elapsed
+                time.sleep(sleep_time)
+            self.last_request_time = time.time()
+
+    def acquire(self):
+        """获取请求许可（wait 的别名）"""
+        self.wait()
 
 
-# ----------------------------
-# 工具：singleflight（同 key 并发合并，带超时保护）
-# ----------------------------
-
-@dataclass
-class _SFSlot:
-    event: threading.Event
-    result: Any = None
-    exc: Optional[BaseException] = None
-    started_at: float = 0.0
-
-
-class _SingleFlight:
+def retry_on_failure(
+    max_retries: int = 3,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    retryable_exceptions: tuple = (Exception,)
+):
     """
-    同 key 的并发请求只允许一个执行，其它等待结果。
-    增强点：为 follower 增加等待超时，防止 leader 线程卡死时所有请求一起卡死。
+    带指数退避的重试装饰器
+
+    :param max_retries: 最大重试次数
+    :param initial_delay: 初始延迟（秒）
+    :param backoff_factor: 退避倍数
+    :param retryable_exceptions: 可重试的异常类型
     """
-    def __init__(self, wait_timeout: float = 120.0):
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retryable_exceptions as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        logger.debug(f"请求失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}, {delay:.1f}秒后重试...")
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        logger.warning(f"请求失败，已达最大重试次数 ({max_retries + 1}): {e}")
+                        raise
+
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+class PathCache:
+    """
+    路径缓存，带 TTL（生存时间）支持
+    """
+
+    def __init__(self, default_ttl: int = 3600):
+        """
+        :param default_ttl: 默认缓存过期时间（秒）
+        """
+        self.default_ttl = default_ttl
+        self._cache: Dict[str, Tuple[int, float]] = {}  # path -> (cid, timestamp)
         self._lock = threading.Lock()
-        self._inflight: Dict[str, _SFSlot] = {}
-        self.wait_timeout = float(wait_timeout)
 
-    def do(self, key: str, fn: Callable[[], Any]) -> Any:
+    def get(self, path: str) -> Optional[int]:
+        """获取缓存的 CID，如果缓存过期则返回 None"""
         with self._lock:
-            slot = self._inflight.get(key)
-            if slot is None:
-                slot = _SFSlot(event=threading.Event(), started_at=time.time())
-                self._inflight[key] = slot
-                leader = True
-            else:
-                leader = False
+            if path not in self._cache:
+                return None
+            cid, timestamp = self._cache[path]
+            if time.time() - timestamp > self.default_ttl:
+                del self._cache[path]
+                return None
+            return cid
 
-        if not leader:
-            # follower：带超时等待，避免永久卡死
-            if not slot.event.wait(self.wait_timeout):
-                with self._lock:
-                    cur = self._inflight.get(key)
-                    if cur is slot:
-                        self._inflight.pop(key, None)
-                raise TimeoutError(f"singleflight wait timeout {self.wait_timeout}s for key={key}")
-            if slot.exc:
-                raise slot.exc
-            return slot.result
+    def set(self, path: str, cid: int):
+        """设置缓存"""
+        with self._lock:
+            self._cache[path] = (cid, time.time())
 
-        # leader：真正执行业务函数
-        try:
-            res = fn()
-            slot.result = res
-            return res
-        except BaseException as e:
-            slot.exc = e
-            raise
-        finally:
-            slot.event.set()
-            with self._lock:
-                self._inflight.pop(key, None)
+    def invalidate(self, path: str):
+        """使缓存失效"""
+        with self._lock:
+            self._cache.pop(path, None)
 
+    def clear(self):
+        """清空缓存"""
+        with self._lock:
+            self._cache.clear()
 
-# ----------------------------
-# 工具：命名锁池（带超时 + 简单 GC）
-# ----------------------------
+    def __contains__(self, path: str) -> bool:
+        return self.get(path) is not None
 
-class _LockPool:
-    """
-    命名锁池：
-      - 替代 defaultdict(threading.Lock)，防止 key 无上限增长；
-      - acquire 支持超时，避免因为单个线程卡死导致所有等待线程永久阻塞。
-    """
-    def __init__(self, maxsize: int = 4096, default_timeout: float = 120.0):
-        self.maxsize = maxsize
-        self.default_timeout = float(default_timeout)
-        self._locks: Dict[str, threading.Lock] = {}
-        self._order = deque()
-        self._meta_lock = threading.Lock()
-
-    def _get_lock(self, name: str) -> threading.Lock:
-        with self._meta_lock:
-            lk = self._locks.get(name)
-            if lk is None:
-                lk = threading.Lock()
-                self._locks[name] = lk
-                self._order.append(name)
-                # 简单 FIFO GC，避免锁数量无限增长
-                while len(self._order) > self.maxsize:
-                    old = self._order.popleft()
-                    if old != name:
-                        self._locks.pop(old, None)
-            return lk
-
-    def acquire(self, name: str, timeout: Optional[float] = None) -> threading.Lock:
-        lk = self._get_lock(name)
-        to = self.default_timeout if timeout is None else float(timeout)
-        ok = lk.acquire(timeout=to)
-        if not ok:
-            raise TimeoutError(f"acquire lock timeout {to}s for key={name}")
-        return lk
-
-    def release(self, name: str) -> None:
-        with self._meta_lock:
-            lk = self._locks.get(name)
-        if lk:
-            lk.release()
-
-    @contextmanager
-    def hold(self, name: str, timeout: Optional[float] = None):
-        lk = self.acquire(name, timeout=timeout)
-        try:
-            yield
-        finally:
-            lk.release()
-
-
-# ----------------------------
-# 工具：指数退避重试 + 风控/限频识别
-# ----------------------------
-
-def _stringify_exc(e: Exception) -> str:
-    try:
-        return f"{type(e).__name__}: {e}"
-    except Exception:
-        return repr(e)
-
-
-def _is_risk_control_text(s: str) -> bool:
-    if not s:
-        return False
-    s = s.lower()
-    keywords = [
-        "risk", "风控", "频繁", "太快", "too fast", "limit", "rate", "throttle",
-        "验证码", "verify", "validation", "安全校验", "请稍后", "稍后再试", "系统繁忙",
-        "429", "403", "forbidden", "denied"
-    ]
-    return any(k in s for k in keywords)
-
-
-def _is_risk_control_error(resp_or_exc: Any) -> bool:
-    if isinstance(resp_or_exc, Exception):
-        return _is_risk_control_text(_stringify_exc(resp_or_exc))
-    if isinstance(resp_or_exc, dict):
-        parts = []
-        for k in ("error", "msg", "message", "errno", "errcode", "code"):
-            v = resp_or_exc.get(k)
-            if v is not None:
-                parts.append(str(v))
-        return _is_risk_control_text(" | ".join(parts))
-    return _is_risk_control_text(str(resp_or_exc))
-
-
-# ----------------------------
-# 主类（外部接口兼容）
-# ----------------------------
 
 class P115ClientManager:
-    """115网盘客户端管理器（singleflight + 统计 + 风控友好 + 死锁保护）"""
+    """115网盘客户端管理器"""
 
-    _DEFAULT_LIMITS = {
-        "dir_getid": (2.0, 0.25),
-        "fs_files": (1.0, 0.35),
-        "share_iter": (1.2, 0.30),
-        "share_receive": (0.7, 0.45),
-        "user_my_info": (0.5, 0.20),
-        "fs_makedirs": (0.8, 0.35),
-    }
+    # 默认配置常量
+    DEFAULT_MIN_INTERVAL = 1.5      # API 请求基础间隔（秒），实际会有 ±30% 随机浮动
+    DEFAULT_RECURSION_DELAY = 1.0   # 递归遍历子目录延迟（秒）
+    DEFAULT_PATH_CACHE_TTL = 3600   # 路径缓存过期时间（秒）
+    DEFAULT_MAX_RETRIES = 3         # 最大重试次数
+    DEFAULT_JITTER_RATIO = 0.3      # 请求间隔随机抖动比例（±30%）
 
-    def __init__(self, cookies: str, user_agent: str = None):
+    def __init__(
+        self,
+        cookies: str,
+        user_agent: str = None,
+        min_interval: float = None,
+        recursion_delay: float = None,
+        path_cache_ttl: int = None
+    ):
+        """
+        初始化115客户端
+
+        :param cookies: 115 Cookie
+        :param user_agent: User-Agent
+        :param min_interval: API 请求最小间隔（秒），默认 0.5
+        :param recursion_delay: 递归遍历子目录延迟（秒），默认 0.3
+        :param path_cache_ttl: 路径缓存过期时间（秒），默认 3600
+        """
         self.cookies = cookies
         self.user_agent = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         self.client: Optional[Any] = None
 
-        # 兼容原字段
-        self.path_cache: Dict[str, int] = {"/": 0}
+        # 速率限制
+        _min_interval = min_interval if min_interval is not None else self.DEFAULT_MIN_INTERVAL
+        self.rate_limiter = RateLimiter(min_interval=_min_interval)
 
-        # 强缓存
-        self._pid_cache = _LRUTTLCache(maxsize=8000, ttl_sec=60 * 60)
-        self._pid_cache.set("/", 0, ttl_sec=24 * 3600)
+        # 递归延迟
+        self.recursion_delay = recursion_delay if recursion_delay is not None else self.DEFAULT_RECURSION_DELAY
 
-        self._files_cache = _LRUTTLCache(maxsize=2000, ttl_sec=15.0)
+        # 路径缓存（带 TTL）
+        _path_cache_ttl = path_cache_ttl if path_cache_ttl is not None else self.DEFAULT_PATH_CACHE_TTL
+        self.path_cache = PathCache(default_ttl=_path_cache_ttl)
+        # 根目录始终缓存
+        self.path_cache.set("/", 0)
 
-        # 命名锁池（替代 defaultdict(threading.Lock)）
-        self._locks = _LockPool(maxsize=4096, default_timeout=120.0)
-
-        # limiter
-        self._limiters: Dict[str, _RateLimiter] = {}
-        for name, (rps, jitter) in self._DEFAULT_LIMITS.items():
-            self._limiters[name] = _RateLimiter(rps=rps, jitter_sec=jitter)
-
-        # singleflight：用于 fs_dir_getid(path)，带等待超时
-        self._sf_dir_getid = _SingleFlight(wait_timeout=120.0)
-
-        # 请求计数
-        self._req_count = defaultdict(int)
-        self._req_count_lock = threading.Lock()
-        self._log_req_every = 20  # 打印频率稍微放大一点
-        self._req_total = 0
+        # 分享信息缓存（URL -> {share_code, receive_code}）
+        self._share_info_cache: Dict[str, Dict[str, str]] = {}
 
         if P115_AVAILABLE and cookies:
             try:
@@ -321,123 +190,26 @@ class P115ClientManager:
             except Exception as e:
                 logger.error(f"初始化 P115Client 失败: {e}")
 
-    # ----------------------------
-    # 统计：对外可选调用（不影响现有业务）
-    # ----------------------------
-
-    def get_request_stats(self) -> Dict[str, int]:
-        """获取接口请求次数统计（含 total）"""
-        with self._req_count_lock:
-            d = dict(self._req_count)
-            d["total"] = self._req_total
-            return d
-
-    def log_request_stats(self, level: str = "info") -> None:
-        """打印当前请求次数统计"""
-        stats = self.get_request_stats()
-        items = sorted(
-            ((k, v) for k, v in stats.items() if k != "total"),
-            key=lambda x: -x[1],
-        )
-        msg = "115 API 请求统计：total={total} | ".format(total=stats.get("total", 0)) + \
-              ", ".join([f"{k}={v}" for k, v in items[:12]])
-        getattr(logger, level, logger.info)(msg)
-
-    def _inc_req(self, api_name: str) -> None:
-        with self._req_count_lock:
-            self._req_count[api_name] += 1
-            self._req_total += 1
-            if self._log_req_every > 0 and (self._req_total % self._log_req_every == 0):
-                # 定期输出一次，避免刷屏
-                self.log_request_stats(level="info")
-
-    # ----------------------------
-    # 内部：统一请求入口（节流 + 退避重试 + 计数）
-    # ----------------------------
-
-    def _call(
-        self,
-        api_name: str,
-        fn: Callable,
-        *args,
-        max_retry: int = 5,
-        base_delay: float = 0.8,
-        must_check_state: bool = False,
-        call_timeout: float = 10.0,
-        **kwargs
-    ):
+    def _rate_limited_call(self, func: Callable, *args, **kwargs):
         """
-        统一接口调用入口：
-          - 限流
-          - 统计
-          - 每次调用加硬超时（call_timeout）
-          - 风控识别 + 指数退避重试
+        带速率限制的 API 调用封装
+
+        :param func: 要调用的函数
+        :return: 函数返回值
         """
-        limiter = self._limiters.get(api_name)
-        last_exc: Optional[BaseException] = None
-
-        for i in range(max_retry + 1):
-            try:
-                if limiter:
-                    limiter.wait()
-
-                # 计数：只统计“实际发出”的调用次数
-                self._inc_req(api_name)
-
-                # 关键：在独立线程中执行 fn，带硬超时
-                resp = _run_with_timeout(
-                    api_name=api_name,
-                    fn=fn,
-                    args=args,
-                    kwargs=kwargs,
-                    timeout=call_timeout,
-                )
-
-                if must_check_state and isinstance(resp, dict):
-                    if not resp.get("state", False) and _is_risk_control_error(resp):
-                        raise RuntimeError(f"{api_name} risk-control resp: {resp}")
-                return resp
-
-            except Exception as e:
-                last_exc = e
-
-                # 超时 / 连接错误 / 解析错误 等，都走这里
-                # 只有“风控/限频类”错误才会重试，其它直接抛出
-                if not _is_risk_control_error(e):
-                    # 打个日志方便你判断是不是超时
-                    logger.error(f"{api_name} 调用异常（不重试）: {_stringify_exc(e)}")
-                    raise
-
-                if i >= max_retry:
-                    raise
-
-                delay = base_delay * (2 ** i) + random.uniform(0.0, 0.65)
-                logger.warning(
-                    f"{api_name} 疑似风控/限频，退避 {delay:.2f}s 重试({i+1}/{max_retry})：{_stringify_exc(e)}"
-                )
-                time.sleep(delay)
-
-        if last_exc:
-            raise last_exc
-
-
-    # ----------------------------
-    # 对外方法（签名/返回兼容）
-    # ----------------------------
+        self.rate_limiter.wait()
+        return func(*args, **kwargs)
 
     def check_login(self) -> bool:
+        """检查登录状态"""
         if not self.client:
             return False
+
         try:
-            user_info = self._call(
-                "user_my_info",
-                self.client.user_my_info,
-                max_retry=3,
-                base_delay=0.8,
-                must_check_state=True,
-            )
-            if isinstance(user_info, dict) and user_info.get("state"):
-                uname = user_info.get("data", {}).get("uname", "未知")
+            self.rate_limiter.wait()
+            user_info = self.client.user_my_info()
+            if user_info.get("state"):
+                uname = user_info.get('data', {}).get('uname', '未知')
                 logger.info(f"115 登录成功: {uname}")
                 return True
             return False
@@ -445,196 +217,181 @@ class P115ClientManager:
             logger.error(f"检查 115 登录状态失败: {e}")
             return False
 
-    def _dir_getid_singleflight(self, path: str) -> Dict[str, Any]:
-        """
-        对 fs_dir_getid(path) 做 singleflight 合并，带等待超时。
-        """
-        if not self.client:
-            return {}
-        key = f"dir_getid:{path}"
-        return self._sf_dir_getid.do(
-            key,
-            lambda: self._call(
-                "dir_getid",
-                self.client.fs_dir_getid,
-                path,
-                max_retry=4,
-                base_delay=0.9,
-            ),
-        )
-
     def get_pid_by_path(self, path: str, mkdir: bool = True) -> int:
+        """
+        通过文件夹路径获取 CID (Directory ID)
+
+        :param path: 文件夹路径 (例如: /我的接收/电影)
+        :param mkdir: 如果目录不存在，是否创建
+        :return: 文件夹 ID，0 为根目录，-1 为获取失败
+        """
         if not self.client:
             return -1
 
-        path = (path or "").replace("\\", "/")
+        # 规范化路径
+        path = path.replace("\\", "/")
         if not path.startswith("/"):
             path = "/" + path
         path = path.rstrip("/")
 
+        # 根目录
         if not path or path == "/":
             return 0
 
-        if path in self.path_cache:
-            return self.path_cache[path]
+        # 尝试从缓存获取
+        cached_cid = self.path_cache.get(path)
+        if cached_cid is not None:
+            return cached_cid
 
-        hit, cached = self._pid_cache.get(path)
-        if hit:
-            if isinstance(cached, int) and cached >= 0:
-                self.path_cache[path] = cached
-                return cached
-            if not mkdir and cached == -1:
-                return -1
+        # 尝试直接通过 API 获取完整路径
+        try:
+            self.rate_limiter.wait()
+            resp = self.client.fs_dir_getid(path)
+            if resp.get("id"):
+                cid = int(resp["id"])
+                self.path_cache.set(path, cid)
+                return cid
+        except Exception as e:
+            logger.debug(f"直接获取路径 ID 失败 ({path}): {e}")
 
-        # 同一路径串行化（创建目录时尤其重要），带锁超时保护
-        lock_name = f"pid:{path}"
-        with self._locks.hold(lock_name):
-            # double-check
-            if path in self.path_cache:
-                return self.path_cache[path]
+        # 如果不创建，则返回失败
+        if not mkdir:
+            return -1
 
-            hit, cached = self._pid_cache.get(path)
-            if hit:
-                if isinstance(cached, int) and cached >= 0:
-                    self.path_cache[path] = cached
-                    return cached
-                if not mkdir and cached == -1:
-                    return -1
+        # 递归创建/查找（优化：从最近的已缓存路径开始）
+        parts = [p for p in path.split("/") if p]
+        parent_id = 0
+        current_path = ""
+        start_index = 0
 
-            # 1) singleflight 的 getid
+        # 找到最近的已缓存父目录
+        temp_path = ""
+        for i, part in enumerate(parts):
+            temp_path = f"{temp_path}/{part}"
+            temp_cid = self.path_cache.get(temp_path)
+            if temp_cid is not None:
+                parent_id = temp_cid
+                current_path = temp_path
+                start_index = i + 1
+
+        # 从未缓存的部分开始处理
+        for i in range(start_index, len(parts)):
+            part = parts[i]
+            current_path = f"{current_path}/{part}"
+
+            # 再次检查缓存（可能在并发中被设置）
+            cached = self.path_cache.get(current_path)
+            if cached is not None:
+                parent_id = cached
+                continue
+
+            # 尝试获取该层级 ID
             try:
-                resp = self._dir_getid_singleflight(path)
-                if isinstance(resp, dict) and resp.get("id"):
+                self.rate_limiter.wait()
+                resp = self.client.fs_dir_getid(current_path)
+                if resp.get("id"):
                     cid = int(resp["id"])
-                    self.path_cache[path] = cid
-                    self._pid_cache.set(path, cid, ttl_sec=2 * 3600)
-                    return cid
-            except TimeoutError as e:
-                logger.error(f"fs_dir_getid singleflight 超时: {e}")
+                    self.path_cache.set(current_path, cid)
+                    parent_id = cid
+                    continue
             except Exception:
-                # 这里不直接失败，后面继续尝试逐级创建
                 pass
 
-            if not mkdir:
-                self._pid_cache.set(path, -1, ttl_sec=120.0)
+            # 创建目录
+            try:
+                self.rate_limiter.wait()
+                resp = self.client.fs_makedirs_app(part, pid=parent_id)
+                check_response(resp)
+                if resp.get("state"):
+                    cid = int(resp["cid"])
+                    self.path_cache.set(current_path, cid)
+                    parent_id = cid
+                    logger.info(f"创建目录成功: {current_path} -> {cid}")
+                else:
+                    logger.error(f"创建目录失败 {current_path}: {resp.get('error')}")
+                    return -1
+            except Exception as e:
+                logger.error(f"创建目录异常 {current_path}: {e}")
                 return -1
 
-            # 2) 逐级创建/查找（每级也用 singleflight），锁范围仅限当前 path 的整体过程
-            parent_id = 0
-            current_path = ""
-            parts = [p for p in path.split("/") if p]
-
-            for part in parts:
-                current_path = f"{current_path}/{part}"
-
-                if current_path in self.path_cache:
-                    parent_id = self.path_cache[current_path]
-                    continue
-
-                hit, cached = self._pid_cache.get(current_path)
-                if hit and isinstance(cached, int) and cached >= 0:
-                    self.path_cache[current_path] = cached
-                    parent_id = cached
-                    continue
-
-                got = False
-                try:
-                    resp = self._dir_getid_singleflight(current_path)
-                    if isinstance(resp, dict) and resp.get("id"):
-                        cid = int(resp["id"])
-                        self.path_cache[current_path] = cid
-                        self._pid_cache.set(current_path, cid, ttl_sec=2 * 3600)
-                        parent_id = cid
-                        got = True
-                except TimeoutError as e:
-                    logger.error(f"fs_dir_getid singleflight 超时: {current_path} -> {e}")
-                    got = False
-                except Exception:
-                    got = False
-
-                if got:
-                    continue
-
-                # 创建目录（在 pid:{path} 的 lock 内，避免并发重复创建）
-                try:
-                    resp = self._call(
-                        "fs_makedirs",
-                        self.client.fs_makedirs_app,
-                        part,
-                        pid=parent_id,
-                        max_retry=5,
-                        base_delay=1.0,
-                        must_check_state=True,
-                    )
-                    check_response(resp)
-                    if resp.get("state"):
-                        cid = int(resp["cid"])
-                        self.path_cache[current_path] = cid
-                        self._pid_cache.set(current_path, cid, ttl_sec=2 * 3600)
-                        parent_id = cid
-                        logger.info(f"创建目录成功: {current_path} -> {cid}")
-                    else:
-                        logger.error(f"创建目录失败 {current_path}: {resp.get('error')}")
-                        self._pid_cache.set(current_path, -1, ttl_sec=120.0)
-                        return -1
-                except Exception as e:
-                    logger.error(f"创建目录异常 {current_path}: {e}")
-                    self._pid_cache.set(current_path, -1, ttl_sec=120.0)
-                    return -1
-
-            self.path_cache[path] = parent_id
-            self._pid_cache.set(path, parent_id, ttl_sec=2 * 3600)
-            return parent_id
-
-    # ---- 分享相关 ----
+        return parent_id
 
     def extract_share_info(self, url: str) -> Dict[str, str]:
+        """
+        解析分享链接，获取 share_code 和 receive_code（带缓存）
+
+        :param url: 115 分享链接
+        :return: {"share_code": ..., "receive_code": ...}
+        """
         if not P115_AVAILABLE:
             return {}
+
+        # 检查缓存
+        if url in self._share_info_cache:
+            return self._share_info_cache[url]
+
         try:
             payload = share_extract_payload(url)
-            return {
+            result = {
                 "share_code": payload.get("share_code", ""),
                 "receive_code": payload.get("receive_code", "")
             }
+            # 缓存结果
+            self._share_info_cache[url] = result
+            return result
         except Exception as e:
             logger.error(f"解析分享链接失败: {e}")
             return {}
 
-    def list_share_files(self, share_url: str, cid: int = 0, max_depth: int = 3) -> List[dict]:
+    def list_share_files(
+            self,
+            share_url: str,
+            cid: int = 0,
+            max_depth: int = 3
+    ) -> List[dict]:
+        """
+        列出分享链接内的文件
+
+        :param share_url: 115 分享链接
+        :param cid: 目录 ID，0 为根目录
+        :param max_depth: 最大递归深度
+        :return: 文件列表
+        """
         if not self.client:
             return []
 
         info = self.extract_share_info(share_url)
         share_code = info.get("share_code")
         receive_code = info.get("receive_code")
+
         if not share_code or not receive_code:
             logger.error("无效的分享链接或解析失败")
             return []
 
         return self._list_share_files_recursive(
-            share_code,
-            receive_code,
+            share_code=share_code,
+            receive_code=receive_code,
             cid=cid,
             depth=1,
-            max_depth=max_depth,
+            max_depth=max_depth
         )
 
     def _list_share_files_recursive(
-        self,
-        share_code: str,
-        receive_code: str,
-        cid: int = 0,
-        depth: int = 1,
-        max_depth: int = 3,
+            self,
+            share_code: str,
+            receive_code: str,
+            cid: int = 0,
+            depth: int = 1,
+            max_depth: int = 3
     ) -> List[dict]:
+        """递归列出分享文件（带速率限制）"""
         if depth > max_depth:
             return []
 
-        files: List[dict] = []
+        files = []
         try:
-            if self._limiters.get("share_iter"):
-                self._limiters["share_iter"].wait()
+            # 速率限制
+            self.rate_limiter.wait()
 
             iterator = share_iterdir(
                 self.client,
@@ -654,41 +411,52 @@ class P115ClientManager:
                     "pick_code": item.get("pick_code", ""),
                 }
 
+                # 递归获取子目录内容（带随机延迟）
                 if file_info["is_dir"] and depth < max_depth:
+                    # 递归前增加随机延迟，避免频繁请求
+                    if self.recursion_delay > 0:
+                        import random
+                        jitter = self.recursion_delay * 0.3  # ±30% 随机浮动
+                        delay = self.recursion_delay + random.uniform(-jitter, jitter)
+                        time.sleep(delay)
+
                     sub_cid = int(item.get("id", 0))
-                    file_info["children"] = self._list_share_files_recursive(
-                        share_code,
-                        receive_code,
+                    children = self._list_share_files_recursive(
+                        share_code=share_code,
+                        receive_code=receive_code,
                         cid=sub_cid,
                         depth=depth + 1,
-                        max_depth=max_depth,
+                        max_depth=max_depth
                     )
+                    file_info["children"] = children
 
                 files.append(file_info)
 
         except Exception as e:
-            if _is_risk_control_error(e):
-                delay = 1.5 + random.uniform(0.0, 1.0)
-                logger.warning(
-                    f"列出分享文件疑似风控，延迟 {delay:.2f}s 后放弃本层：{_stringify_exc(e)}"
-                )
-                time.sleep(delay)
-            else:
-                logger.error(f"列出分享文件失败: {e}")
+            logger.error(f"列出分享文件失败: {e}")
 
         return files
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
+        """
+        转存整个分享链接到指定目录
+
+        :param share_url: 115 分享链接
+        :param save_path: 保存路径
+        :return: 是否成功
+        """
         if not self.client:
             return False
 
         info = self.extract_share_info(share_url)
         share_code = info.get("share_code")
         receive_code = info.get("receive_code")
+
         if not share_code or not receive_code:
             logger.error("无效的分享链接或解析失败")
             return False
 
+        # 获取目标目录 CID
         parent_id = self.get_pid_by_path(save_path, mkdir=True)
         if parent_id == -1:
             logger.error(f"无法获取或创建目标目录: {save_path}")
@@ -696,53 +464,77 @@ class P115ClientManager:
 
         logger.info(f"转存分享到目录 ID: {parent_id} ({save_path})")
 
-        payload = {
-            "share_code": share_code,
-            "receive_code": receive_code,
-            "file_id": "0",
-            "cid": parent_id,
-            "is_check": 0,
-        }
+        # 执行转存 (file_id=0 表示转存所有内容)
+        return self._do_transfer(
+            share_code=share_code,
+            receive_code=receive_code,
+            file_id="0",
+            parent_id=parent_id,
+            save_path=save_path
+        )
 
-        lock_name = f"receive_all:{share_code}:{parent_id}"
-        with self._locks.hold(lock_name):
-            try:
-                resp = self._call(
-                    "share_receive",
-                    self.client.share_receive,
-                    payload,
-                    max_retry=6,
-                    base_delay=1.2,
-                    must_check_state=True,
-                )
-                if resp.get("state"):
-                    logger.info(f"转存成功！已保存到: {save_path}")
-                    return True
-                error_msg = resp.get("error", "未知错误")
-                if "重复" in str(error_msg) or "已存在" in str(error_msg):
-                    logger.info("转存内容疑似已存在，视为成功")
-                    return True
-                logger.error(f"转存失败: {error_msg}")
-                return False
-            except Exception as e:
-                logger.error(f"转存过程中发生异常: {e}")
-                return False
+    def transfer_file(
+            self,
+            share_url: str,
+            file_id: str,
+            save_path: str
+    ) -> bool:
+        """
+        转存分享中的单个文件
 
-    def transfer_file(self, share_url: str, file_id: str, save_path: str) -> bool:
+        :param share_url: 115 分享链接
+        :param file_id: 文件 ID
+        :param save_path: 保存路径
+        :return: 是否成功
+        """
         if not self.client:
             return False
 
         info = self.extract_share_info(share_url)
         share_code = info.get("share_code")
         receive_code = info.get("receive_code")
+
         if not share_code or not receive_code:
             logger.error("无效的分享链接或解析失败")
             return False
 
+        # 获取目标目录 CID
         parent_id = self.get_pid_by_path(save_path, mkdir=True)
         if parent_id == -1:
             logger.error(f"无法获取或创建目标目录: {save_path}")
             return False
+
+        # 执行单文件转存
+        return self._do_transfer(
+            share_code=share_code,
+            receive_code=receive_code,
+            file_id=file_id,
+            parent_id=parent_id,
+            save_path=save_path
+        )
+
+    def _do_transfer(
+            self,
+            share_code: str,
+            receive_code: str,
+            file_id: str,
+            parent_id: int,
+            save_path: str,
+            max_retries: int = None
+    ) -> bool:
+        """
+        执行实际转存操作（带重试）
+
+        :param share_code: 分享码
+        :param receive_code: 接收码
+        :param file_id: 文件ID，"0" 表示转存全部
+        :param parent_id: 目标目录 ID
+        :param save_path: 保存路径（用于日志）
+        :param max_retries: 最大重试次数
+        :return: 是否成功
+        """
+        if max_retries is None:
+            max_retries = self.DEFAULT_MAX_RETRIES
 
         payload = {
             "share_code": share_code,
@@ -752,35 +544,57 @@ class P115ClientManager:
             "is_check": 0,
         }
 
-        lock_name = f"receive_one:{share_code}:{file_id}:{parent_id}"
-        with self._locks.hold(lock_name):
+        last_error = None
+        for attempt in range(max_retries + 1):
             try:
-                resp = self._call(
-                    "share_receive",
-                    self.client.share_receive,
-                    payload,
-                    max_retry=6,
-                    base_delay=1.2,
-                    must_check_state=True,
-                )
+                self.rate_limiter.wait()
+                resp = self.client.share_receive(payload)
+
                 if resp.get("state"):
-                    logger.info(f"文件转存成功！文件ID: {file_id}, 保存到: {save_path}")
+                    if file_id == "0":
+                        logger.info(f"转存成功！已保存到: {save_path}")
+                    else:
+                        logger.info(f"文件转存成功！文件ID: {file_id}, 保存到: {save_path}")
                     return True
+                else:
+                    error_msg = resp.get("error", "未知错误")
+                    error_code = resp.get("errno", resp.get("errcode", 0))
 
-                error_msg = resp.get("error", "未知错误")
-                if "重复" in str(error_msg) or "已存在" in str(error_msg):
-                    logger.info(f"文件已存在，跳过: {file_id}")
-                    return True
+                    # 检查是否是重复文件
+                    if "重复" in error_msg or "已存在" in error_msg:
+                        logger.info(f"文件已存在，跳过: {file_id}")
+                        return True
 
-                logger.error(f"文件转存失败: {error_msg}")
-                return False
+                    # 检查是否是可重试的错误（如限流）
+                    if error_code in (990001, 990002, 990009):  # 常见的限流错误码
+                        if attempt < max_retries:
+                            wait_time = (attempt + 1) * 2  # 递增等待时间
+                            logger.warning(f"遇到限流，{wait_time}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
+                            time.sleep(wait_time)
+                            continue
+
+                    logger.error(f"转存失败: {error_msg} (错误码: {error_code})")
+                    return False
+
             except Exception as e:
-                logger.error(f"文件转存过程中发生异常: {e}")
-                return False
+                last_error = e
+                if attempt < max_retries:
+                    wait_time = (attempt + 1) * 1.5
+                    logger.warning(f"转存异常: {e}, {wait_time:.1f}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"转存过程中发生异常: {e}")
+                    return False
 
-    # ---- 列表相关 ----
+        return False
 
     def list_files(self, path: str) -> List[dict]:
+        """
+        列出指定路径下的文件
+
+        :param path: 目录路径
+        :return: 文件列表
+        """
         if not self.client:
             return []
 
@@ -788,63 +602,44 @@ class P115ClientManager:
         if cid == -1:
             return []
 
-        cache_key = f"files:{cid}"
-        hit, cached = self._files_cache.get(cache_key)
-        if hit and isinstance(cached, list):
-            return cached
-
         try:
-            all_data: List[dict] = []
-            limit = 500
-            offset = 0
-            max_pages = 20
-
-            for _ in range(max_pages):
-                params = {"cid": cid, "limit": limit, "offset": offset}
-                resp = self._call(
-                    "fs_files",
-                    self.client.fs_files,
-                    params,
-                    max_retry=4,
-                    base_delay=1.0,
-                    must_check_state=True,
-                )
-                if not (isinstance(resp, dict) and resp.get("state")):
-                    break
-                data = resp.get("data", []) or []
-                if not isinstance(data, list):
-                    break
-                all_data.extend(data)
-                if len(data) < limit:
-                    break
-                offset += limit
-
-            if not all_data:
-                resp = self._call(
-                    "fs_files",
-                    self.client.fs_files,
-                    {"cid": cid, "limit": 1000},
-                    max_retry=4,
-                    base_delay=1.0,
-                    must_check_state=True,
-                )
-                if isinstance(resp, dict) and resp.get("state"):
-                    all_data = resp.get("data", []) or []
-
-            if isinstance(all_data, list):
-                self._files_cache.set(cache_key, all_data, ttl_sec=15.0)
-                return all_data
+            self.rate_limiter.wait()
+            resp = self.client.fs_files({"cid": cid, "limit": 1000})
+            if resp.get("state"):
+                return resp.get("data", [])
             return []
         except Exception as e:
             logger.error(f"列出文件失败: {e}")
             return []
 
     def list_directories(self, path: str) -> List[dict]:
+        """
+        列出指定路径下的所有目录（不包含文件）
+
+        :param path: 目录路径
+        :return: 目录列表，每个目录包含 name 和 path 字段
+        """
         files = self.list_files(path)
-        directories: List[dict] = []
+
+        # 过滤出目录（fid=0 表示目录）
+        directories = []
         for f in files:
-            if f.get("fid") == 0:
+            if f.get("fid") == 0:  # 是目录
                 dir_name = f.get("name", "")
                 dir_path = f"{path.rstrip('/')}/{dir_name}" if path != "/" else f"/{dir_name}"
-                directories.append({"name": dir_name, "path": dir_path, "cid": f.get("cid", 0)})
+                directories.append({
+                    "name": dir_name,
+                    "path": dir_path,
+                    "cid": f.get("cid", 0)
+                })
+
         return directories
+
+    def clear_path_cache(self):
+        """清空路径缓存"""
+        self.path_cache.clear()
+        self.path_cache.set("/", 0)
+
+    def clear_share_cache(self):
+        """清空分享信息缓存"""
+        self._share_info_cache.clear()

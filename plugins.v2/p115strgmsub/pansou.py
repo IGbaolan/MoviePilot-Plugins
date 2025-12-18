@@ -149,6 +149,7 @@ class PanSouClient:
             search_url = f"{self.base_url}/api/search"
             payload = {
                 "kw": keyword,
+                "refresh": True,
                 "res": "results"
             }
             if channels:
@@ -159,6 +160,7 @@ class PanSouClient:
 
             logger.info(f"PanSou 搜索: {payload}")
             response = requests.post(search_url, json=payload, headers=headers, timeout=120)
+          
 
             # Token 失效重试
             if response.status_code == 401 and self.auth_enabled:
