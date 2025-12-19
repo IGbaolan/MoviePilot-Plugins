@@ -45,7 +45,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -441,6 +441,8 @@ class P115StrgmSub(_PluginBase):
             if nullbr_resources:
                 p115_results = self._convert_nullbr_to_pansou_format(nullbr_resources)
                 logger.info(f"Nullbr 找到 {len(p115_results)} 个资源")
+            else:
+                logger.info(f"Nullbr 优先模式未找到资源，将回退到 PanSou 搜索")
         
         # 2. 如果 NullBR 未找到，使用 PanSou
         if not p115_results and self._pansou_enabled and self._pansou_client:
@@ -627,9 +629,15 @@ class P115StrgmSub(_PluginBase):
                     logger.info(f"检查分享：{resource_title} - {share_url}")
 
                     try:
+                        # 先检查分享链接是否有效
+                        share_status = self._p115_manager.check_share_status(share_url)
+                        if not share_status.is_valid:
+                            logger.warning(f"分享链接无效：{share_url}，原因：{share_status.status_text}")
+                            continue
+
                         share_files = self._p115_manager.list_share_files(share_url)
                         if not share_files:
-                            logger.debug(f"分享链接无内容或已失效：{share_url}")
+                            logger.info(f"分享链接无内容：{share_url}")
                             continue
 
                         # 匹配电影文件（查找最大的视频文件，应用过滤条件）
@@ -649,7 +657,7 @@ class P115StrgmSub(_PluginBase):
                             # 洗版模式下检查是否需要升级资源
                             if is_best_version and movie_history_score >= 0:
                                 if current_score <= movie_history_score:
-                                    logger.debug(f"电影 {mediainfo.title} 已有分数 {movie_history_score}，当前 {current_score}，跳过")
+                                    logger.info(f"电影 {mediainfo.title} 已有分数 {movie_history_score}，当前 {current_score}，跳过")
                                     continue
                                 else:
                                     logger.info(f"电影 {mediainfo.title} 洗版：旧分数 {movie_history_score} -> 新分数 {current_score}")
@@ -889,20 +897,29 @@ class P115StrgmSub(_PluginBase):
 
                     # 简单的标题过滤
                     if mediainfo.title not in resource_title:
-                        # logger.debug(f"跳过不匹配的资源: {resource_title}")
+                        # logger.info(f"跳过不匹配的资源: {resource_title}")
                         # continue
                         pass
 
                     logger.info(f"检查分享：{resource_title} - {share_url}")
 
                     try:
+                        # 先检查分享链接是否有效
+                        share_status = self._p115_manager.check_share_status(share_url)
+                        if not share_status.is_valid:
+                            logger.warning(f"分享链接无效：{share_url}，原因：{share_status.status_text}")
+                            continue
+
                         # 列出分享内容
                         share_files = self._p115_manager.list_share_files(share_url)
                         if not share_files:
-                            logger.debug(f"分享链接无内容或已失效：{share_url}")
+                            logger.info(f"分享链接无内容：{share_url}")
                             continue
 
+                        logger.info(f"分享包含 {len(share_files)} 个文件/目录")
+
                         # 匹配缺失剧集（应用过滤条件）
+                        matched_count = 0
                         for episode in missing_episodes[:]:  # 使用切片复制，因为会修改列表
                             matched_file = FileMatcher.match_episode_file(
                                 share_files,
@@ -913,6 +930,7 @@ class P115StrgmSub(_PluginBase):
                             )
 
                             if matched_file:
+                                matched_count += 1
                                 file_name = matched_file.get('name', '')
                                 logger.info(f"找到匹配文件：{file_name} -> E{episode:02d}")
 
@@ -924,7 +942,7 @@ class P115StrgmSub(_PluginBase):
                                 if is_best_version and episode in episode_history_scores:
                                     old_score = episode_history_scores[episode]
                                     if current_score <= old_score:
-                                        logger.debug(f"E{episode:02d} 已有分数 {old_score}，当前 {current_score}，跳过")
+                                        logger.info(f"E{episode:02d} 已有分数 {old_score}，当前 {current_score}，跳过")
                                         continue
                                     else:
                                         logger.info(f"E{episode:02d} 洗版：旧分数 {old_score} -> 新分数 {current_score}")
@@ -977,6 +995,10 @@ class P115StrgmSub(_PluginBase):
                                     logger.info(f"成功转存：{mediainfo.title} S{season:02d}E{episode:02d} {score_info}{upgrade_info}")
                                 else:
                                     logger.error(f"转存失败：{mediainfo.title} S{season:02d}E{episode:02d}")
+
+                        # 如果该分享没有匹配到任何剧集，打印提示
+                        if matched_count == 0:
+                            logger.info(f"该分享未匹配到 S{season} 的任何缺失剧集，可能是季数不匹配或文件名无法识别")
 
                         # 如果所有缺失剧集都已转存，跳出循环
                         if not missing_episodes:

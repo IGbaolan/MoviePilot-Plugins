@@ -5,6 +5,7 @@ import time
 import threading
 from pathlib import Path
 from functools import wraps
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Tuple, Callable
 
 from app.log import logger
@@ -16,6 +17,38 @@ try:
 except ImportError:
     P115_AVAILABLE = False
     logger.warning("p115client 未安装，115网盘功能不可用，请安装: pip install p115client")
+
+
+@dataclass
+class ShareLinkStatus:
+    """
+    分享链接状态信息
+
+    用于表示 115 分享链接的有效性和详细状态
+    """
+    is_valid: bool = False              # 链接是否有效可用
+    is_expired: bool = False            # 链接是否已过期
+    is_cancelled: bool = False          # 链接是否已被取消
+    is_deleted: bool = False            # 分享的文件是否已删除
+    error_code: int = 0                 # 错误码（0 表示无错误）
+    error_message: str = ""             # 错误信息
+    file_count: int = 0                 # 分享中的文件数量
+    share_info: Dict[str, Any] = field(default_factory=dict)  # 分享详情
+
+    @property
+    def status_text(self) -> str:
+        """获取状态的中文描述"""
+        if self.is_valid:
+            return "有效"
+        if self.is_expired:
+            return "已过期"
+        if self.is_cancelled:
+            return "已取消"
+        if self.is_deleted:
+            return "文件已删除"
+        if self.error_message:
+            return self.error_message
+        return "未知状态"
 
 
 class RateLimiter:
@@ -343,6 +376,103 @@ class P115ClientManager:
             logger.error(f"解析分享链接失败: {e}")
             return {}
 
+    def check_share_status(self, share_url: str) -> ShareLinkStatus:
+        """
+        检查分享链接的状态（是否有效、过期、失效等）
+
+        :param share_url: 115 分享链接
+        :return: ShareLinkStatus 对象，包含详细的状态信息
+        """
+        # 默认返回无效状态
+        status = ShareLinkStatus()
+
+        if not self.client:
+            status.error_message = "客户端未初始化"
+            return status
+
+        # 解析分享链接
+        info = self.extract_share_info(share_url)
+        share_code = info.get("share_code")
+        receive_code = info.get("receive_code")
+
+        if not share_code:
+            status.error_message = "无效的分享链接格式"
+            return status
+
+        try:
+            # 使用 share_snap 接口检查分享状态
+            self.rate_limiter.wait()
+            payload = {
+                "share_code": share_code,
+                "receive_code": receive_code or "",
+                "cid": 0,
+                "limit": 1,  # 只获取1条记录，用于验证
+                "offset": 0,
+            }
+            resp = self.client.share_snap(payload)
+
+            # 检查响应状态
+            state = resp.get("state")
+
+            if state is True or state == 1:
+                # 分享有效
+                status.is_valid = True
+                status.error_code = 0
+
+                # 获取分享信息
+                data = resp.get("data", {})
+                share_info = data.get("shareinfo", {})
+                file_list = data.get("list", [])
+
+                status.file_count = int(data.get("count", len(file_list)))
+                status.share_info = {
+                    "share_title": share_info.get("share_title", ""),
+                    "share_state": share_info.get("share_state", ""),
+                    "file_count": status.file_count,
+                    "create_time": share_info.get("create_time", ""),
+                    "expire_time": share_info.get("expire_time", ""),
+                    "user_name": share_info.get("user_name", ""),
+                }
+            else:
+                # 分享无效，解析错误信息
+                status.is_valid = False
+                status.error_code = resp.get("errno", resp.get("errcode", -1))
+                status.error_message = resp.get("error", resp.get("message", "未知错误"))
+
+                # 根据错误码判断具体原因
+                error_msg_lower = status.error_message.lower()
+                error_msg = status.error_message
+
+                # 判断是否过期
+                if "过期" in error_msg or "expired" in error_msg_lower:
+                    status.is_expired = True
+
+                # 判断是否取消
+                if "取消" in error_msg or "cancel" in error_msg_lower:
+                    status.is_cancelled = True
+
+                # 判断是否删除
+                if "删除" in error_msg or "不存在" in error_msg or "delete" in error_msg_lower:
+                    status.is_deleted = True
+
+                logger.debug(f"分享链接无效: {status.error_message} (errno: {status.error_code})")
+
+        except Exception as e:
+            status.error_message = f"检查分享状态异常: {str(e)}"
+            logger.error(status.error_message)
+
+        return status
+
+    def is_share_valid(self, share_url: str) -> bool:
+        """
+        快速检查分享链接是否有效
+
+        :param share_url: 115 分享链接
+        :return: True 表示有效，False 表示无效或失效
+        """
+        status = self.check_share_status(share_url)
+        return status.is_valid
+
     def list_share_files(
             self,
             share_url: str,
@@ -400,6 +530,7 @@ class P115ClientManager:
                 cid=cid,
                 app="web",
             )
+            
 
             for item in iterator:
                 file_info = {

@@ -53,9 +53,9 @@ class SubscribeFilter:
             if re.search(self.quality, file_name, re.IGNORECASE):
                 score += 100  # 质量匹配加 100 分
                 matched_count += 1
-                logger.debug(f"文件 {file_name} 匹配质量规则: {self.quality}")
+                logger.info(f"文件 {file_name} 匹配质量规则: {self.quality}")
             else:
-                logger.debug(f"文件 {file_name} 不匹配质量规则: {self.quality}")
+                logger.info(f"文件 {file_name} 不匹配质量规则: {self.quality}")
                 if self.strict:
                     return False, 0
 
@@ -65,9 +65,9 @@ class SubscribeFilter:
             if re.search(self.resolution, file_name, re.IGNORECASE):
                 score += 100  # 分辨率匹配加 100 分
                 matched_count += 1
-                logger.debug(f"文件 {file_name} 匹配分辨率规则: {self.resolution}")
+                logger.info(f"文件 {file_name} 匹配分辨率规则: {self.resolution}")
             else:
-                logger.debug(f"文件 {file_name} 不匹配分辨率规则: {self.resolution}")
+                logger.info(f"文件 {file_name} 不匹配分辨率规则: {self.resolution}")
                 if self.strict:
                     return False, 0
 
@@ -77,9 +77,9 @@ class SubscribeFilter:
             if re.search(self.effect, file_name, re.IGNORECASE):
                 score += 100  # 特效匹配加 100 分
                 matched_count += 1
-                logger.debug(f"文件 {file_name} 匹配特效规则: {self.effect}")
+                logger.info(f"文件 {file_name} 匹配特效规则: {self.effect}")
             else:
-                logger.debug(f"文件 {file_name} 不匹配特效规则: {self.effect}")
+                logger.info(f"文件 {file_name} 不匹配特效规则: {self.effect}")
                 if self.strict:
                     return False, 0
 
@@ -226,12 +226,23 @@ class FileMatcher:
         loose_matches = []
         loosest_matches = []
 
+        # 诊断统计
+        stats = {
+            "total_files": 0,
+            "non_video": 0,
+            "other_season": 0,
+            "filter_rejected": 0,
+            "episode_mismatch": 0,
+            "directories": 0,
+        }
+
         for file in files:
             file_name = file.get("name", "")
             is_dir = file.get("is_dir", False)
 
             # 跳过目录（但可以递归处理子文件）
             if is_dir:
+                stats["directories"] += 1
                 sub_files = file.get("children", [])
                 if sub_files:
                     matched = FileMatcher.match_episode_file(sub_files, title, season, episode, subscribe_filter)
@@ -239,13 +250,18 @@ class FileMatcher:
                         return matched
                 continue
 
+            stats["total_files"] += 1
+
             # 检查文件扩展名
             ext = Path(file_name).suffix.lower()
             if ext not in FileMatcher.VIDEO_EXTENSIONS:
+                stats["non_video"] += 1
                 continue
 
             # 如果明确包含其他季的标识，直接跳过
             if FileMatcher._contains_other_season(file_name, season):
+                stats["other_season"] += 1
+                logger.info(f"文件 {file_name} 属于其他季，跳过（目标: S{season}）")
                 continue
 
             # 应用订阅过滤条件
@@ -253,7 +269,8 @@ class FileMatcher:
             if subscribe_filter and subscribe_filter.has_filters():
                 matched, filter_score = subscribe_filter.match(file_name)
                 if not matched:
-                    logger.debug(f"文件 {file_name} 不符合订阅过滤条件，跳过")
+                    stats["filter_rejected"] += 1
+                    logger.info(f"文件 {file_name} 不符合订阅过滤条件，跳过")
                     continue
 
             # 优先检查 SxxExx 格式（最准确）
@@ -263,6 +280,9 @@ class FileMatcher:
                 # 如果有明确的 SxxExx 格式，必须精确匹配，不再使用其他模式
                 if found_season == season and found_episode == episode:
                     strict_matches.append((file, filter_score))
+                else:
+                    stats["episode_mismatch"] += 1
+                    # logger.info(f"文件 {file_name} 集数不匹配（找到: S{found_season}E{found_episode}，目标: S{season}E{episode}）")
                 # 不匹配则跳过这个文件，不再尝试其他模式
                 continue
 
@@ -294,6 +314,21 @@ class FileMatcher:
         if loosest_matches:
             loosest_matches.sort(key=lambda x: x[1], reverse=True)
             return loosest_matches[0][0]
+
+        # 没有匹配时，输出诊断信息
+        if stats["total_files"] > 0:
+            reasons = []
+            if stats["other_season"] > 0:
+                reasons.append(f"季数不匹配:{stats['other_season']}个")
+            if stats["episode_mismatch"] > 0:
+                reasons.append(f"集数不匹配:{stats['episode_mismatch']}个")
+            if stats["filter_rejected"] > 0:
+                reasons.append(f"过滤条件不符:{stats['filter_rejected']}个")
+            if stats["non_video"] > 0:
+                reasons.append(f"非视频文件:{stats['non_video']}个")
+            
+            if reasons:
+                logger.info(f"S{season}E{episode} 无匹配 - 视频文件{stats['total_files']}个, {', '.join(reasons)}")
 
         return None
 
@@ -344,7 +379,7 @@ class FileMatcher:
                 if subscribe_filter and subscribe_filter.has_filters():
                     matched, filter_score = subscribe_filter.match(file_name)
                     if not matched:
-                        logger.debug(f"电影文件 {file_name} 不符合订阅过滤条件，跳过")
+                        logger.info(f"电影文件 {file_name} 不符合订阅过滤条件，跳过")
                         continue
 
                 candidates.append((file, filter_score))
@@ -383,7 +418,7 @@ class FileMatcher:
             # 列出网盘目录中的文件
             files = p115_manager.list_files(save_dir)
             if not files:
-                logger.debug(f"网盘目录为空或不存在: {save_dir}")
+                logger.info(f"网盘目录为空或不存在: {save_dir}")
                 return existing_episodes
 
             logger.info(f"检查网盘目录 {save_dir}，共 {len(files)} 个文件")
@@ -404,7 +439,7 @@ class FileMatcher:
 
                 # 检查是否包含其他季的标识，如果是则跳过
                 if FileMatcher._contains_other_season(file_name, season):
-                    logger.debug(f"跳过其他季文件: {file_name}")
+                    logger.info(f"跳过其他季文件: {file_name}")
                     continue
 
                 # 使用MetaInfo识别文件信息
@@ -421,7 +456,7 @@ class FileMatcher:
 
                 if season_matches and meta.begin_episode:
                     existing_episodes.add(meta.begin_episode)
-                    logger.debug(f"识别到已存在集数: {file_name} -> S{season:02d}E{meta.begin_episode:02d}")
+                    logger.info(f"识别到已存在集数: {file_name} -> S{season:02d}E{meta.begin_episode:02d}")
 
                     # 如果是剧集范围（如E01-E03），添加所有集数
                     if meta.end_episode and meta.end_episode != meta.begin_episode:
