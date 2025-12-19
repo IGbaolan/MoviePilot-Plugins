@@ -50,7 +50,7 @@ pip install p115client>=0.0.8.2 sqlitetools>=0.0.7
 - TG 搜索频道（可选），为空的话将搜索PanSou默认频道
 
 **Nullbr**（TMDB精准匹配）:
-- APP ID 和 API Key
+- API Key
 - 可设置优先使用 Nullbr 或 PanSou
 
 ### 高级配置
