@@ -142,7 +142,7 @@ class P115StrgmSub(_PluginBase):
         
         # GitHub 原始文件 URL
         
-        base_url = "https://raw.githubusercontent.com/mrtian2016/hdhive_resource/main/"
+        base_url = "https://ghfast.top/https://raw.githubusercontent.com/mrtian2016/hdhive_resource/main/"
         download_url = f"{base_url}/{so_filename}"
         
         logger.info(f"开始下载 hdhive .so 文件: {download_url}")
