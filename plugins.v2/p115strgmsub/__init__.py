@@ -539,7 +539,7 @@ class P115StrgmSub(_PluginBase):
             try:
                 import asyncio
                 import os
-                from .hdhive import create_async_client as create_hdhive_async_client
+                from .lib.hdhive import create_async_client as create_hdhive_async_client
                 
                 proxy_host = os.environ.get("PROXY_HOST")
                 proxy = {"http": proxy_host, "https": proxy_host} if proxy_host else None
