@@ -3,11 +3,12 @@
     "name": "115网盘订阅追更",
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.1.1": "1. 优化HDHive；",
       "v1.1.0": "1. 新增 Nullbr、PanSou、HDHive 代理配置支持；2. 固定执行周期为 8 小时，移除自定义周期配置；3. 优化 UI 配置布局",
       "v1.0.9": "1. 新增HDHive资源搜索，测试中目前仅支持linux x86_64，不稳定慎用；2. 优化转存逻辑，支持同时更新 note 字段和 lack_episode，避免重复更新；",
       "v1.0.8": "1. 新增 API 调用次数统计功能；2. 新增 115 网盘风控配置项，支持设置转存限制；3. 新增 Nullbr AppID 配置；4. 优化默认定时任务周期，从每小时改为每 8 小时执行；5. 优化通知发送逻辑；",
