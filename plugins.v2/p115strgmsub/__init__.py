@@ -532,46 +532,7 @@ class P115StrgmSub(_PluginBase):
 
         hdhive_media_type = HDHiveMediaType.MOVIE if media_type == MediaType.MOVIE else HDHiveMediaType.TV
         
-        # 方法1: 尝试使用同步客户端（Cookie 模式）
-        if self._hdhive_client:
-            try:
-                logger.info(f"使用 HDHive (Sync) 查询: {mediainfo.title} (TMDB ID: {mediainfo.tmdb_id})")
-                
-                # 获取媒体信息
-                with self._hdhive_client as client:
-                    media = client.get_media_by_tmdb_id(mediainfo.tmdb_id, hdhive_media_type)
-                    if not media:
-                        logger.info(f"HDHive (Sync) 未找到媒体: {mediainfo.title}")
-                        return []
-                    
-                    # 获取资源列表
-                    resources_result = client.get_resources(media.slug, hdhive_media_type, media_id=media.id)
-                    if not resources_result or not resources_result.success:
-                        logger.info(f"HDHive (Sync) 获取资源列表失败: {mediainfo.title}")
-                        return []
-                    
-                    # 过滤免费的 115 资源
-                    free_115_resources = []
-                    for res in resources_result.resources:
-                        if hasattr(res, 'website') and res.website.value == '115' and res.is_free:
-                            # 获取分享链接
-                            share_result = client.get_share_url(res.slug)
-                            if share_result and share_result.url:
-                                free_115_resources.append({
-                                    "url": share_result.url,
-                                    "title": res.title,
-                                    "update_time": ""
-                                })
-                    
-                    if free_115_resources:
-                        logger.info(f"HDHive (Sync) 找到 {len(free_115_resources)} 个免费 115 资源")
-                        return free_115_resources
-                    else:
-                        logger.info(f"HDHive (Sync) 未找到免费 115 资源")
-                        return []
-                        
-            except Exception as e:
-                logger.warning(f"HDHive (Sync) 查询失败: {e}，尝试异步模式...")
+        
         
         # 方法2: 回退到异步客户端（用户名/密码模式）
         if self._hdhive_username and self._hdhive_password:
@@ -634,6 +595,46 @@ class P115StrgmSub(_PluginBase):
                 logger.error(f"HDHive (Async) 查询失败: {e}")
                 return []
         
+        # 方法1: 尝试使用同步客户端（Cookie 模式）
+        if self._hdhive_client:
+            try:
+                logger.info(f"使用 HDHive (Sync) 查询: {mediainfo.title} (TMDB ID: {mediainfo.tmdb_id})")
+                
+                # 获取媒体信息
+                with self._hdhive_client as client:
+                    media = client.get_media_by_tmdb_id(mediainfo.tmdb_id, hdhive_media_type)
+                    if not media:
+                        logger.info(f"HDHive (Sync) 未找到媒体: {mediainfo.title}")
+                        return []
+                    
+                    # 获取资源列表
+                    resources_result = client.get_resources(media.slug, hdhive_media_type, media_id=media.id)
+                    if not resources_result or not resources_result.success:
+                        logger.info(f"HDHive (Sync) 获取资源列表失败: {mediainfo.title}")
+                        return []
+                    
+                    # 过滤免费的 115 资源
+                    free_115_resources = []
+                    for res in resources_result.resources:
+                        if hasattr(res, 'website') and res.website.value == '115' and res.is_free:
+                            # 获取分享链接
+                            share_result = client.get_share_url(res.slug)
+                            if share_result and share_result.url:
+                                free_115_resources.append({
+                                    "url": share_result.url,
+                                    "title": res.title,
+                                    "update_time": ""
+                                })
+                    
+                    if free_115_resources:
+                        logger.info(f"HDHive (Sync) 找到 {len(free_115_resources)} 个免费 115 资源")
+                        return free_115_resources
+                    else:
+                        logger.info(f"HDHive (Sync) 未找到免费 115 资源")
+                        return []
+                        
+            except Exception as e:
+                logger.warning(f"HDHive (Sync) 查询失败: {e}，尝试异步模式...")
         return []
 
     def _check_and_finish_subscribe(self, subscribe, mediainfo, success_episodes):
