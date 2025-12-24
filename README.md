@@ -13,7 +13,7 @@ MoviePilot订阅 -> 本插件搜索转存 -> STRM助手生成STRM -> 媒体库�
 ## 功能特点
 
 - **支持电影和电视剧**订阅自动追更
-- **三重搜索源**：Nullbr + HDHive（TMDB ID 精准匹配）+ PanSou（网盘聚合搜索）
+- **三重搜索源**：Nullbr（TMDB ID 精准匹配）+ PanSou（网盘聚合搜索）
 - **智能匹配**：支持 S01E01、第X集、EP01 等多种命名格式
 - **洗版模式**：自动升级更高质量资源（基于订阅的质量/分辨率/特效设置）
 - **订阅过滤**：继承 MoviePilot 订阅的质量、分辨率、特效过滤条件
@@ -25,14 +25,10 @@ MoviePilot订阅 -> 本插件搜索转存 -> STRM助手生成STRM -> 媒体库�
 ## 依赖
 
 ```bash
-pip install p115client>=0.0.8.2 sqlitetools>=0.0.7
+pip install p115client>=0.0.8.2 sqlitetools>=0.0.7 playwright
 ```
 
-HDHive Playwright 模式需要额外安装：
-```bash
-pip install playwright
-playwright install chromium
-```
+
 
 ## 配置说明
 
@@ -58,12 +54,6 @@ playwright install chromium
 - APP ID 和 API Key
 - 基于 TMDB ID 查询，准确率高
 
-**HDHive**（TMDB精准匹配）:
-- 支持两种查询模式：
-  - `playwright`: 浏览器模拟（需要安装 playwright）
-  - `api`: API 直接请求（需要 Cookie）
-- 用户名/密码或 Cookie 认证
-- 支持 Cookie 自动刷新
 
 **PanSou**（网盘聚合搜索）:
 - API 地址、用户名/密码（可选认证）
@@ -107,7 +97,7 @@ playwright install chromium
 
 1. 在 MoviePilot 插件管理中安装本插件
 2. 配置 115 Cookie
-3. 配置至少一个搜索源（Nullbr、HDHive 或 PanSou）
+3. 配置至少一个搜索源（Nullbr 或 PanSou）
 4. 在 MoviePilot 中添加订阅
 5. 启用插件，等待定时任务执行或点击"立即搜索"按钮
 
