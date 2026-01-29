@@ -34,23 +34,23 @@ from .utils import (
 lock = Lock()
 
 
-class P115StrgmSub(_PluginBase):
-    """115网盘订阅追更插件"""
+class P115StrgmSubPansou(_PluginBase):
+    """115网盘订阅追更插件(PanSou版)"""
 
     # 插件名称
-    plugin_name = "115网盘订阅追更"
+    plugin_name = "115网盘订阅追更(PanSou版)"
     # 插件描述
-    plugin_desc = "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失的电影和剧集。"
+    plugin_desc = "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失的电影和剧集。支持PanSou高频搜索。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.2.7"
+    plugin_version = "1.0.0"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
     author_url = "https://github.com/mrtian2016"
     # 插件配置项ID前缀
-    plugin_config_prefix = "p115strgmsub_"
+    plugin_config_prefix = "p115strgmsub_pansou_"
     plugin_order = 20
     auth_level = 1
 
@@ -551,13 +551,14 @@ class P115StrgmSub(_PluginBase):
             self._enabled = config.get("enabled", False)
 
             self._cron = (config.get("cron", self._cron) or "").strip()
-            if self._cron:
-                ok = self._cron_interval_ge_min_hours(self._cron, self._MIN_INTERVAL_HOURS)
-                if not ok:
-                    logger.warning(
-                        f"Cron 过于频繁（要求间隔>= {self._MIN_INTERVAL_HOURS}h）：{self._cron}，已回退默认 30 */8 * * *"
-                    )
-                    self._cron = "30 */8 * * *"
+            # PanSou版本移除8小时限制，允许更高频搜索
+            # if self._cron:
+            #     ok = self._cron_interval_ge_min_hours(self._cron, self._MIN_INTERVAL_HOURS)
+            #     if not ok:
+            #         logger.warning(
+            #             f"Cron 过于频繁（要求间隔>= {self._MIN_INTERVAL_HOURS}h）：{self._cron}，已回退默认 30 */8 * * *"
+            #         )
+            #         self._cron = "30 */8 * * *"
 
             self._notify = config.get("notify", False)
             self._onlyonce = config.get("onlyonce", False)
@@ -865,11 +866,12 @@ class P115StrgmSub(_PluginBase):
         if not self._enabled:
             return []
 
-        if self._cron and self._cron_interval_ge_min_hours(self._cron, self._MIN_INTERVAL_HOURS):
+        # PanSou版本：直接使用用户配置的cron，不做8小时限制检查
+        if self._cron:
             try:
                 return [{
-                    "id": "P115StrgmSub",
-                    "name": "115网盘订阅追更服务",
+                    "id": "P115StrgmSubPansou",
+                    "name": "115网盘订阅追更服务(PanSou版)",
                     "trigger": CronTrigger.from_crontab(self._cron),
                     "func": self.sync_subscribes,
                     "kwargs": {}
@@ -878,8 +880,8 @@ class P115StrgmSub(_PluginBase):
                 logger.warning(f"Cron 表达式无效：{self._cron}，将回退 interval=8h。错误：{e}")
 
         return [{
-            "id": "P115StrgmSub",
-            "name": "115网盘订阅追更服务",
+            "id": "P115StrgmSubPansou",
+            "name": "115网盘订阅追更服务(PanSou版)",
             "trigger": "interval",
             "func": self.sync_subscribes,
             "kwargs": {"hours": 8}
