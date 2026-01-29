@@ -4,11 +4,12 @@
     "release": true,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.2.6",
+    "version": "1.2.7",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.2.7": "1. 修复命令丢失问题；",
       "v1.2.6": "1. 合并 https://github.com/frankk007/MoviePilot-Plugins 的 1.2.5 版本；2. 修复 HDHive Cookie 不能自动刷新问题；3. 修复 HDHive 配置无法保存问题；4. 优化代理配置，兼容用户名密码格式；",
       "v1.1.9": "1. 修复订阅完成状态检查时的异常处理。",
       "v1.1.8": "1. 优化剧集文件名匹配逻辑。",

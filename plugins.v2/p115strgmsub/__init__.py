@@ -44,7 +44,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -846,6 +846,20 @@ class P115StrgmSub(_PluginBase):
                 "summary": "清空历史记录"
             }
         ]
+    
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        """定义远程控制命令"""
+        return [{
+            "cmd": "/p115_sub_action",
+            "event": EventType.PluginAction,
+            "desc": "115网盘订阅追更",
+            "category": "订阅",
+            "data": {
+                "action": "p115_sub_action"
+            }
+        }]
+
 
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
@@ -1037,7 +1051,7 @@ class P115StrgmSub(_PluginBase):
         if not event:
             return
         event_data = event.event_data
-        if not event_data or event_data.get("action") != "p115_sync":
+        if not event_data or event_data.get("action") != "p115_sub_action":
             return
 
         logger.info("收到命令，开始执行追更任务")
