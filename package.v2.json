@@ -4,12 +4,11 @@
     "release": true,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。支持PanSou高频搜索。",
     "labels": "订阅,115网盘,PanSou",
-    "version": "1.0.1",
+    "version": "1.0.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
-      "v1.0.1": "修复GitHub Actions打包问题，规范插件文件夹命名。",
       "v1.0.0": "1. 修改插件ID为P115StrgmSubPansou；2. 针对PanSou搜索解除8小时计划任务限制；3. 首个PanSou定制版本发布。"
     }
   }
