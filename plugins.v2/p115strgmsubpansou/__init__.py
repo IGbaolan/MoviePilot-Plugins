@@ -21,15 +21,10 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, NotificationType
 
-from .clients import PanSouClient, P115ClientManager, NullbrClient
+from .clients import PanSouClient, P115ClientManager
 from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler
 from .ui import UIConfig
-from .utils import (
-    download_so_file,
-    get_hdhive_token_info,
-    check_hdhive_cookie_valid,
-    refresh_hdhive_cookie_with_playwright,
-)
+from .utils import download_so_file
 
 lock = Lock()
 
@@ -77,18 +72,6 @@ class P115StrgmSubPansou(_PluginBase):
     _only_115: bool = True
     _exclude_subscribes: List[int] = []
 
-    _nullbr_enabled: bool = False
-    _nullbr_appid: str = ""
-    _nullbr_api_key: str = ""
-
-    _hdhive_enabled: bool = False
-    _hdhive_username: str = ""
-    _hdhive_password: str = ""
-    _hdhive_cookie: str = ""
-    _hdhive_auto_refresh: bool = False
-    _hdhive_refresh_before: int = 86400
-    _hdhive_query_mode: str = "playwright"
-
     # 是否屏蔽系统订阅（True=已屏蔽系统订阅，False=已恢复系统订阅）
     _block_system_subscribe: bool = False
 
@@ -105,8 +88,6 @@ class P115StrgmSubPansou(_PluginBase):
     # 运行时对象
     _pansou_client: Optional[PanSouClient] = None
     _p115_manager: Optional[P115ClientManager] = None
-    _nullbr_client: Optional[NullbrClient] = None
-    _hdhive_client: Optional[Any] = None
 
     # 处理器
     _search_handler: Optional[SearchHandler] = None
@@ -500,44 +481,6 @@ class P115StrgmSubPansou(_PluginBase):
             logger.info(f"已屏蔽系统订阅：检测到订阅改动，按规则不自动拉回（subscribe_id={sid}）")
         return
 
-    # ------------------ HDHive cookie（保留） ------------------
-
-    def _check_and_refresh_hdhive_cookie(self) -> Optional[str]:
-        if not self._hdhive_auto_refresh:
-            return self._hdhive_cookie if self._hdhive_cookie else None
-
-        if not self._hdhive_username or not self._hdhive_password:
-            logger.warning("HDHive: 已启用自动刷新但未配置用户名/密码，无法刷新 Cookie")
-            return self._hdhive_cookie if self._hdhive_cookie else None
-
-        if self._hdhive_cookie:
-            is_valid, reason = check_hdhive_cookie_valid(self._hdhive_cookie, self._hdhive_refresh_before)
-            if is_valid:
-                logger.info(f"HDHive: Cookie 检查通过 - {reason}")
-                return self._hdhive_cookie
-            else:
-                logger.info(f"HDHive: Cookie 需要刷新 - {reason}")
-        else:
-            logger.info("HDHive: 未配置 Cookie，尝试登录获取")
-
-        logger.info("HDHive: 开始刷新 Cookie...")
-        new_cookie = refresh_hdhive_cookie_with_playwright(self._hdhive_username, self._hdhive_password)
-
-        if new_cookie:
-            token_info = get_hdhive_token_info(new_cookie)
-            if token_info:
-                logger.info(
-                    f"HDHive: 新 Cookie 信息 - 用户ID: {token_info['user_id']}, "
-                    f"过期时间: {token_info['exp_time'].strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-            self._hdhive_cookie = new_cookie
-            self.__update_config()
-            logger.info("HDHive: Cookie 刷新成功并已保存到配置")
-            return new_cookie
-
-        logger.error("HDHive: Cookie 刷新失败")
-        return self._hdhive_cookie if self._hdhive_cookie else None
-
     # ------------------ init_plugin ------------------
 
     def init_plugin(self, config: dict = None):
@@ -576,17 +519,6 @@ class P115StrgmSubPansou(_PluginBase):
             self._only_115 = config.get("only_115", True)
             self._exclude_subscribes = config.get("exclude_subscribes", []) or []
 
-            self._nullbr_enabled = config.get("nullbr_enabled", False)
-            self._nullbr_appid = config.get("nullbr_appid", "")
-            self._nullbr_api_key = config.get("nullbr_api_key", "")
-
-            self._hdhive_enabled = config.get("hdhive_enabled", False)
-            self._hdhive_query_mode = config.get("hdhive_query_mode", "playwright")
-            self._hdhive_username = config.get("hdhive_username", "")
-            self._hdhive_password = config.get("hdhive_password", "")
-            self._hdhive_cookie = config.get("hdhive_cookie", "")
-            self._hdhive_auto_refresh = config.get("hdhive_auto_refresh", False)
-            self._hdhive_refresh_before = int(config.get("hdhive_refresh_before", 86400) or 86400)
 
             self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
             self._batch_size = int(config.get("batch_size", 20) or 20)
@@ -657,51 +589,6 @@ class P115StrgmSubPansou(_PluginBase):
                 proxy=proxy
             )
 
-        if self._nullbr_enabled:
-            if not self._nullbr_appid or not self._nullbr_api_key:
-                missing = []
-                if not self._nullbr_appid:
-                    missing.append("APP ID")
-                if not self._nullbr_api_key:
-                    missing.append("API Key")
-                logger.warning(f"Nullbr 已启用但缺少必要配置：{', '.join(missing)}，将无法使用 Nullbr 查询功能")
-                self._nullbr_client = None
-            else:
-                self._nullbr_client = NullbrClient(app_id=self._nullbr_appid, api_key=self._nullbr_api_key, proxy=proxy)
-                logger.info("Nullbr 客户端初始化成功")
-
-        # HDHive 客户端初始化
-        if self._hdhive_enabled:
-            if self._hdhive_query_mode == "playwright":
-                # Playwright 模式：搜索时动态创建客户端
-                if not self._hdhive_username or not self._hdhive_password:
-                    logger.warning("HDHive Playwright 模式需要配置用户名和密码")
-                    self._hdhive_client = None
-                else:
-                    logger.info("HDHive 配置已加载（Playwright 模式，搜索时动态创建客户端）")
-                    self._hdhive_client = None
-            else:
-                # API 模式：需要有效的 Cookie
-                if not self._hdhive_cookie and not (self._hdhive_username and self._hdhive_password):
-                    logger.warning("HDHive API 模式需要配置 Cookie（或用户名/密码用于自动刷新）")
-                    self._hdhive_client = None
-                else:
-                    # 检查并刷新 Cookie
-                    effective_cookie = self._check_and_refresh_hdhive_cookie()
-
-                    if effective_cookie:
-                        try:
-                            from .lib.hdhive import create_client as create_hdhive_client
-                            logger.info(f"HDHive API 模式使用 PROXY: {proxy}")
-                            self._hdhive_client = create_hdhive_client(cookie=effective_cookie, proxy=proxy)
-                            logger.info("HDHive 客户端初始化成功（API 模式）")
-                        except Exception as e:
-                            logger.warning(f"HDHive 客户端初始化失败：{e}")
-                            self._hdhive_client = None
-                    else:
-                        logger.warning("HDHive API 模式缺少有效 Cookie，请配置 Cookie 或启用自动刷新")
-                        self._hdhive_client = None
-
         if self._cookies:
             self._p115_manager = P115ClientManager(cookies=self._cookies)
 
@@ -717,15 +604,7 @@ class P115StrgmSubPansou(_PluginBase):
 
         self._search_handler = SearchHandler(
             pansou_client=self._pansou_client,
-            nullbr_client=self._nullbr_client,
-            hdhive_client=self._hdhive_client,
             pansou_enabled=self._pansou_enabled,
-            nullbr_enabled=self._nullbr_enabled,
-            hdhive_enabled=self._hdhive_enabled,
-            hdhive_query_mode=self._hdhive_query_mode,
-            hdhive_username=self._hdhive_username,
-            hdhive_password=self._hdhive_password,
-            hdhive_cookie=self._hdhive_cookie,
             only_115=self._only_115,
             pansou_channels=self._pansou_channels
         )
@@ -773,17 +652,6 @@ class P115StrgmSubPansou(_PluginBase):
             "pansou_password": self._pansou_password,
             "pansou_auth_enabled": self._pansou_auth_enabled,
             "pansou_channels": self._pansou_channels,
-            "nullbr_enabled": self._nullbr_enabled,
-            "nullbr_appid": self._nullbr_appid,
-            "nullbr_api_key": self._nullbr_api_key,
-            # HDHive 配置
-            "hdhive_enabled": self._hdhive_enabled,
-            "hdhive_query_mode": self._hdhive_query_mode,
-            "hdhive_username": self._hdhive_username,
-            "hdhive_password": self._hdhive_password,
-            "hdhive_cookie": self._hdhive_cookie,
-            "hdhive_auto_refresh": self._hdhive_auto_refresh,
-            "hdhive_refresh_before": self._hdhive_refresh_before,
             # 其他配置
             "exclude_subscribes": self._exclude_subscribes,
             "block_system_subscribe": self._block_system_subscribe,
@@ -892,14 +760,14 @@ class P115StrgmSubPansou(_PluginBase):
     # ======================================================================
 
     def _do_sync(self) -> bool:
-        # 至少启用一个搜索源
-        if not self._pansou_enabled and not self._nullbr_enabled and not self._hdhive_enabled:
-            logger.error("搜索源均未启用（PanSou/Nullbr/HDHive），无法执行")
+        # 检查PanSou搜索源
+        if not self._pansou_enabled:
+            logger.error("PanSou搜索源未启用，无法执行")
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【115网盘订阅追更】配置错误",
-                    text="PanSou、Nullbr、HDHive 均未启用，请至少启用一个搜索源。"
+                    text="PanSou搜索源未启用，请启用后重试。"
                 )
             return False
 
@@ -934,11 +802,6 @@ class P115StrgmSubPansou(_PluginBase):
         try:
             if self._pansou_client:
                 self._pansou_client.reset_api_call_count()
-        except Exception:
-            pass
-        try:
-            if self._nullbr_client:
-                self._nullbr_client.reset_api_call_count()
         except Exception:
             pass
 
