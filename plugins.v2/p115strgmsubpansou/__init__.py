@@ -24,7 +24,6 @@ from app.schemas.types import EventType, MediaType, NotificationType
 from .clients import PanSouClient, P115ClientManager
 from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler
 from .ui import UIConfig
-from .utils import download_so_file
 
 lock = Lock()
 
@@ -486,7 +485,6 @@ class P115StrgmSubPansou(_PluginBase):
     def init_plugin(self, config: dict = None):
         self.stop_service()
         self._ensure_toggle_scheduler()
-        download_so_file(Path(__file__).parent / "lib")
 
         old_block = bool(self._block_system_subscribe)
 
