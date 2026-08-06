@@ -201,6 +201,11 @@ class PanSouClient:
 
         try:
             headers = {"Content-Type": "application/json"}
+            # 模拟浏览器 UA，降低被源站 CDN/WAF 拦截的概率
+            headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            )
 
             # 如果启用认证，获取 Token
             if self.auth_enabled:
@@ -289,8 +294,14 @@ class PanSouClient:
         """
         import time
 
+        # 重试策略：先尝试强制刷新（refresh=true，数据最新），失败后切换为
+        # 缓存模式（refresh=false，服务端负载低、更稳定），提高成功率
+        refresh_plan = [True, False, False, False]
+        payload = dict(payload)
+
         for attempt in range(retries + 1):
             try:
+                payload["refresh"] = refresh_plan[attempt] if attempt < len(refresh_plan) else False
                 self._api_call_count += 1
                 response = requests.post(
                     search_url, json=payload, headers=headers, timeout=120, proxies=self._proxies

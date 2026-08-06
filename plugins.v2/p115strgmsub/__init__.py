@@ -39,7 +39,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.5.6"
+    plugin_version = "1.5.7"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -126,8 +126,6 @@ class P115StrgmSub(_PluginBase):
     _sync_handler: Optional[SyncHandler] = None
     _api_handler: Optional[ApiHandler] = None
 
-    _MIN_INTERVAL_HOURS: int = 8
-
     # ------------------ 调度器 ------------------
 
     def _ensure_toggle_scheduler(self):
@@ -143,37 +141,6 @@ class P115StrgmSub(_PluginBase):
                 self._toggle_scheduler.remove_job(job_id)
             except Exception:
                 pass
-
-    # ------------------ cron间隔校验 ------------------
-
-    @staticmethod
-    def _cron_interval_ge_min_hours(cron_expr: str, min_hours: int) -> bool:
-        cron_expr = (cron_expr or "").strip()
-        if not cron_expr:
-            return False
-        try:
-            tz = pytz.timezone(settings.TZ)
-            trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
-        except Exception:
-            return False
-
-        now = datetime.datetime.now(tz=pytz.timezone(settings.TZ))
-        fire_times: List[datetime.datetime] = []
-        prev = None
-        current = now
-        for _ in range(12):
-            nxt = trigger.get_next_fire_time(prev, current)
-            if not nxt:
-                break
-            fire_times.append(nxt)
-            prev = nxt
-            current = nxt + datetime.timedelta(seconds=1)
-
-        if len(fire_times) < 2:
-            return True
-
-        min_delta = min(fire_times[i + 1] - fire_times[i] for i in range(len(fire_times) - 1))
-        return min_delta >= datetime.timedelta(hours=min_hours)
 
     # ------------------ 站点解析 ------------------
 
@@ -537,10 +504,11 @@ class P115StrgmSub(_PluginBase):
 
             self._cron = (config.get("cron", self._cron) or "").strip()
             if self._cron:
-                ok = self._cron_interval_ge_min_hours(self._cron, self._MIN_INTERVAL_HOURS)
-                if not ok:
+                try:
+                    CronTrigger.from_crontab(self._cron)
+                except Exception:
                     logger.warning(
-                        f"Cron 过于频繁（要求间隔>= {self._MIN_INTERVAL_HOURS}h）：{self._cron}，已回退默认 30 */8 * * *"
+                        f"Cron 表达式无效：{self._cron}，已回退默认 30 */8 * * *"
                     )
                     self._cron = "30 */8 * * *"
 
@@ -937,7 +905,7 @@ class P115StrgmSub(_PluginBase):
 
         services = []
 
-        if self._cron and self._cron_interval_ge_min_hours(self._cron, self._MIN_INTERVAL_HOURS):
+        if self._cron:
             try:
                 services.append({
                     "id": "P115StrgmSub",

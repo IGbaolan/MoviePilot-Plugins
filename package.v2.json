@@ -4,11 +4,12 @@
     "release": true,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.5.6",
+    "version": "1.5.7",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.5.7": "1. 优化PanSou请求：模拟浏览器UA、失败自动切换缓存模式重试，降低源站偶发400/404/403影响；2. 移除执行周期最小8小时限制，Cron 可自由设置；",
       "v1.5.6": "1. 修复PanSou搜索失效：适配新版接口响应格式（merged_by_type）并增加请求重试与全频道降级；2. 固定 p115client 版本；",
       "v1.5.4": "1. 更新115依赖11111",
       "v1.5.3": "1. 更新115依赖",
