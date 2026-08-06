@@ -217,7 +217,7 @@ class PanSouClient:
             payload = {
                 "kw": keyword,
                 "refresh": True,
-                "res": "results"
+                "res": "merge"
             }
             if channels:
                 payload["channels"] = channels
@@ -226,94 +226,30 @@ class PanSouClient:
                 payload["cloud_types"] = cloud_types
 
             logger.info(f"PanSou 搜索: {payload}")
-            self._api_call_count += 1
-            response = requests.post(search_url, json=payload, headers=headers, timeout=120, proxies=self._proxies)
-          
 
-            # Token 失效重试
-            if response.status_code == 401 and self.auth_enabled:
-                self._token = None
-                self._token_expires = None
+            # 带重试的搜索请求（规避接口临时性 HTTP 400 / 非 JSON 响应）
+            result = self._api_search_with_retry(payload, headers, search_url, retries=3, limit=limit)
 
-                token = self._get_token()
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
-                    self._api_call_count += 1
-                    response = requests.post(search_url, json=payload, headers=headers, timeout=30, proxies=self._proxies)
-
-            if response.status_code != 200:
-                return {
-                    "error": f"搜索请求失败: HTTP {response.status_code}",
-                    "keyword": keyword
-                }
-
-            resp_data = response.json()
-
-            # 检查响应状态码
-            if resp_data.get("code") != 0:
-                return {
-                    "error": resp_data.get("message", "搜索失败"),
-                    "keyword": keyword
-                }
-
-            # 获取 data 字段
-            data = resp_data.get("data", {})
-            total = data.get("total", 0)
-            results_list = data.get("results", [])
-
-            # 按网盘类型分组
-            grouped_results = {}
-
-            for item in results_list:
-                title = item.get("title", "")
-                # 清理 title 中的 HTML 标签
-                title = re.sub(r'<[^>]+>', '', title)
-
-                if not self._title_matches_search_key(keyword, title):
-                    continue
-
-                links = item.get("links", [])
-                update_time = item.get("datetime", "")
-
-                for link in links:
-                    pan_type = link.get("type", "unknown")
-                    type_display = self.TYPE_NAMES.get(pan_type, pan_type)
-
-                    if type_display not in grouped_results:
-                        grouped_results[type_display] = []
-
-                    # 限制每种类型的数量
-                    if len(grouped_results[type_display]) >= limit:
-                        continue
-
-                    link_item = {
-                        "url": link.get("url", ""),
-                        "title": title,
-                        "update_time": update_time
-                    }
-
-                    # 如果有密码，添加密码字段
-                    pwd = link.get("password", "")
-                    if pwd:
-                        link_item["password"] = pwd
-
-                    grouped_results[type_display].append(link_item)
-
-            # 按时间倒序排序
-            for pan_type in grouped_results:
-                grouped_results[pan_type].sort(
-                    key=lambda x: x.get("update_time", ""),
-                    reverse=True
+            # 指定频道无结果时，降级为全频道搜索（避免频道列表过时或覆盖不全导致漏检）
+            if channels and result and not any(result.get("results", {}).values()):
+                logger.info(f"PanSou 指定频道无结果，降级为全频道搜索: {keyword}")
+                payload_without_channels = dict(payload)
+                payload_without_channels.pop("channels", None)
+                result = self._api_search_with_retry(
+                    payload_without_channels, headers, search_url, retries=2, limit=limit
                 )
 
-            # 计算总数
-            total_count = sum(len(v) for v in grouped_results.values())
+            if result is None:
+                return {
+                    "error": f"搜索请求失败: PanSou 接口多次请求无有效响应",
+                    "keyword": keyword
+                }
 
             return {
                 "keyword": keyword,
-                "total": total,
-                "count": total_count,
-                "results": grouped_results
+                "total": result.get("total", 0),
+                "count": sum(len(v) for v in result.get("results", {}).values()),
+                "results": result.get("results", {})
             }
 
         except requests.exceptions.Timeout:
@@ -327,6 +263,198 @@ class PanSouClient:
                 "error": f"搜索网盘资源失败: {str(e)}",
                 "keyword": keyword
             }
+
+    def _api_search_with_retry(
+            self,
+            payload: Dict[str, Any],
+            headers: Dict[str, str],
+            search_url: str,
+            retries: int = 3,
+            limit: int = 10
+    ) -> Optional[Dict[str, Any]]:
+        """
+        发起 PanSou 搜索请求并带重试，返回解析后的结果（含 total 与 results）。
+
+        规避现象：
+        - HTTP 400 "The plain HTTP request was sent to HTTPS port"（源站反代配置问题，随机出现）
+        - application/json 但正文无法被解析为 JSON
+        - 突发 403/错误码响应
+
+        :param payload: 请求体
+        :param headers: 请求头
+        :param search_url: 接口地址
+        :param retries: 重试次数（默认 3，共尝试 4 次）
+        :param limit: 每种类型的结果数限制
+        :return: {"total": int, "results": dict}；全部失败返回 None
+        """
+        import time
+
+        for attempt in range(retries + 1):
+            try:
+                self._api_call_count += 1
+                response = requests.post(
+                    search_url, json=payload, headers=headers, timeout=120, proxies=self._proxies
+                )
+
+                # Token 失效时刷新重试一次
+                if response.status_code == 401 and self.auth_enabled:
+                    self._token = None
+                    self._token_expires = None
+                    token = self._get_token()
+                    if token:
+                        headers["Authorization"] = f"Bearer {token}"
+                        self._api_call_count += 1
+                        response = requests.post(
+                            search_url, json=payload, headers=headers, timeout=120, proxies=self._proxies
+                        )
+
+                if response.status_code != 200:
+                    logger.warning(
+                        f"PanSou 搜索非 200 (HTTP {response.status_code})，第 {attempt + 1}/{retries + 1} 次"
+                    )
+                    if attempt < retries:
+                        time.sleep(2 * (attempt + 1))
+                    continue
+
+                try:
+                    resp_data = response.json()
+                except ValueError:
+                    logger.warning(
+                        f"PanSou 响应不是有效 JSON (len={len(response.content)})，第 {attempt + 1}/{retries + 1} 次"
+                    )
+                    if attempt < retries:
+                        time.sleep(2 * (attempt + 1))
+                    continue
+
+                # 检查响应状态码
+                if resp_data.get("code") != 0:
+                    logger.warning(
+                        f"PanSou 响应 code 非 0: {resp_data.get('message', '')}，第 {attempt + 1}/{retries + 1} 次"
+                    )
+                    if attempt < retries:
+                        time.sleep(2 * (attempt + 1))
+                    continue
+
+                data = resp_data.get("data", {})
+                total = data.get("total", 0)
+
+                # 新版 API 返回 merged_by_type（按网盘类型聚合），旧版返回 results 列表
+                merged_by_type = data.get("merged_by_type")
+                if isinstance(merged_by_type, dict) and merged_by_type:
+                    grouped_results = self._parse_merged(merged_by_type, payload.get("kw", ""), limit)
+                else:
+                    grouped_results = self._parse_results(data.get("results", []), payload.get("kw", ""), limit)
+
+                return {
+                    "total": total,
+                    "results": grouped_results
+                }
+
+            except requests.exceptions.Timeout:
+                logger.warning(f"PanSou 搜索请求超时，第 {attempt + 1}/{retries + 1} 次")
+                if attempt < retries:
+                    time.sleep(2 * (attempt + 1))
+            except Exception as e:
+                logger.warning(f"PanSou 搜索请求异常: {e}，第 {attempt + 1}/{retries + 1} 次")
+                if attempt < retries:
+                    time.sleep(2 * (attempt + 1))
+
+        return None
+
+    def _parse_results(self, results_list: List[Dict], keyword: str, limit: int) -> Dict[str, Any]:
+        """解析旧版 data.results 列表格式"""
+        grouped_results = {}
+
+        for item in results_list:
+            title = item.get("title", "")
+            title = re.sub(r'<[^>]+>', '', title)
+
+            if not self._title_matches_search_key(keyword, title):
+                continue
+
+            links = item.get("links", [])
+            update_time = item.get("datetime", "")
+
+            for link in links:
+                pan_type = link.get("type", "unknown")
+                type_display = self.TYPE_NAMES.get(pan_type, pan_type)
+
+                if type_display not in grouped_results:
+                    grouped_results[type_display] = []
+
+                if len(grouped_results[type_display]) >= limit:
+                    continue
+
+                link_item = {
+                    "url": link.get("url", ""),
+                    "title": title,
+                    "update_time": update_time
+                }
+
+                pwd = link.get("password", "")
+                if pwd:
+                    link_item["password"] = pwd
+
+                grouped_results[type_display].append(link_item)
+
+        return grouped_results
+
+    def _parse_merged(self, merged_by_type: Dict[str, Any], keyword: str, limit: int) -> Dict[str, Any]:
+        """
+        解析新版 API 的 merged_by_type 格式
+
+        merged_by_type 结构:
+        {
+          "115": [
+            {
+              "url": "https://115cdn.com/s/...?password=zc39",
+              "password": "zc39",
+              "note": "资源说明/标题",
+              "datetime": "发布时间",
+              "source": "tg:频道名"
+            },
+            ...
+          ],
+          ...
+        }
+
+        :param merged_by_type: 按网盘类型分组的搜索结果
+        :param keyword: 搜索关键词（用于标题匹配过滤）
+        :param limit: 每种类型的结果数限制
+        :return: 按网盘类型中文名分组的结果
+        """
+        grouped_results = {}
+
+        for pan_type, items in merged_by_type.items():
+            type_display = self.TYPE_NAMES.get(pan_type, pan_type)
+
+            if type_display not in grouped_results:
+                grouped_results[type_display] = []
+
+            for item in items or []:
+                # merged 模式下标题在 note 字段
+                title = item.get("note") or item.get("title") or ""
+                title = re.sub(r'<[^>]+>', '', title)
+
+                if not self._title_matches_search_key(keyword, title):
+                    continue
+
+                if len(grouped_results[type_display]) >= limit:
+                    continue
+
+                link_item = {
+                    "url": item.get("url", ""),
+                    "title": title,
+                    "update_time": item.get("datetime", "")
+                }
+
+                pwd = item.get("password", item.get("pwd", ""))
+                if pwd:
+                    link_item["password"] = pwd
+
+                grouped_results[type_display].append(link_item)
+
+        return grouped_results
 
     def search_115(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
